@@ -36,7 +36,7 @@ def list_rooms(db: Session = Depends(get_db)):
     rooms = db.query(Room).order_by(Room.id.desc()).all()
     result = []
     for r in rooms:
-        # 取该房间最近的一局 game_id，前端用于"进入"已开始的对局
+        # 取该房间最近的一局 game_id 与状态，前端用于"进入"已开始的对局
         game = db.query(Game).filter(Game.room_id == r.id).order_by(Game.id.desc()).first()
         result.append({
             "id": r.id,
@@ -44,6 +44,7 @@ def list_rooms(db: Session = Depends(get_db)):
             "seats": json.loads(r.seats),
             "status": r.status,
             "game_id": game.id if game else None,
+            "game_status": game.status if game else None,
         })
     return result
 
@@ -53,12 +54,13 @@ def start_room(room_id: int, db: Session = Depends(get_db)):
     room = get_room(db, room_id)
     if not room:
         raise HTTPException(status_code=404, detail="房间不存在")
-    # 幂等：房间已是 playing 时直接返回现有 game_id（兼容前端缓存过期、双标签 race、
-    # 重复点击等场景）。这避免了"游戏已开始"误报导致用户无法进入已开始的对局。
-    if room.status == "playing":
-        game = db.query(Game).filter(Game.room_id == room_id).order_by(Game.id.desc()).first()
-        if game:
-            return {"game_id": game.id, "status": "playing"}
+    # 幂等：若房间内存在"进行中"的对局，直接返回它（兼容前端缓存过期、双标签 race、
+    # 重复点击等场景）。以 Game.status 为准，避免 Room.status 未同步时返回已结束的旧局。
+    existing_game = db.query(Game).filter(
+        Game.room_id == room_id, Game.status == "playing"
+    ).order_by(Game.id.desc()).first()
+    if existing_game:
+        return {"game_id": existing_game.id, "status": "playing"}
     game = start_game(db, room_id)
     room.status = "playing"
     db.commit()

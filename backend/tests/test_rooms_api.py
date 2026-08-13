@@ -71,3 +71,49 @@ def test_room_restart_creates_new_game(client, db_session):
     s3 = client.post(f"/api/rooms/{room_id}/start")
     assert s3.status_code == 200
     assert s3.json()["game_id"] == game_b
+
+
+def test_room_start_robust_when_room_status_stale(client, db_session):
+    """即使 Room.status 因故未同步，start_room 也必须以 Game.status 为准，不能返回旧终局。"""
+    cfg, player = _make_config_and_player(client)
+    seats = [
+        {"player_id": None, "role": "black"},
+        {"player_id": player["id"], "role": "white"},
+    ]
+    r = client.post("/api/rooms/", json={"mode": "pve", "seats": seats})
+    room_id = r.json()["id"]
+
+    s1 = client.post(f"/api/rooms/{room_id}/start")
+    game_a = s1.json()["game_id"]
+
+    # 只把 game 置为 finished，room.status 故意保留 playing（模拟未同步场景）
+    g = get_game(db_session, game_a)
+    g.status = "finished"
+    db_session.commit()
+
+    s2 = client.post(f"/api/rooms/{room_id}/start")
+    assert s2.status_code == 200
+    game_b = s2.json()["game_id"]
+    assert game_b != game_a
+
+
+def test_list_rooms_returns_game_status(client, db_session):
+    """房间列表应返回最新对局的实际状态，供前端判断按钮是"再来一局"还是"进入观战"。"""
+    cfg, player = _make_config_and_player(client)
+    seats = [
+        {"player_id": None, "role": "black"},
+        {"player_id": player["id"], "role": "white"},
+    ]
+    r = client.post("/api/rooms/", json={"mode": "pve", "seats": seats})
+    room_id = r.json()["id"]
+
+    s1 = client.post(f"/api/rooms/{room_id}/start")
+    game_a = s1.json()["game_id"]
+    g = get_game(db_session, game_a)
+    g.status = "finished"
+    db_session.commit()
+
+    rooms = client.get("/api/rooms/").json()
+    room = next((x for x in rooms if x["id"] == room_id), None)
+    assert room is not None
+    assert room["game_status"] == "finished"

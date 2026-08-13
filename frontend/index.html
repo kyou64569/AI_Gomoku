@@ -1048,10 +1048,13 @@
       const roomList = state.rooms.length === 0
         ? `<div class="empty"><span class="empty-emoji">🀄</span>暂无对局，创建一局开始对弈吧</div>`
         : state.rooms.map(r => {
-            const statusBadge = r.status === 'waiting'
+            const isWaiting = r.status === 'waiting';
+            const isPlaying = !isWaiting && r.game_status === 'playing';
+            const statusBadge = isWaiting
               ? '<span class="badge badge-waiting">等待开始</span>'
-              : '<span class="badge badge-playing">对局中</span>';
+              : (isPlaying ? '<span class="badge badge-playing">对局中</span>' : '<span class="badge badge-finished">已结束</span>');
             const modeBadge = `<span class="badge badge-mode">${r.mode === 'pve' ? '人机对弈' : 'AI 观战'}</span>`;
+            const canStart = isWaiting || !isPlaying;
             return `
               <div class="room-card">
                 <div class="room-info">
@@ -1065,8 +1068,8 @@
                   </div>
                 </div>
                 <div class="room-actions">
-                  ${['waiting', 'finished', 'draw'].includes(r.status)
-                    ? `<button class="btn btn-primary btn-sm" onclick="startRoom(${r.id})">${r.status === 'waiting' ? '开始对局' : '再来一局'}</button>`
+                  ${canStart
+                    ? `<button class="btn btn-primary btn-sm" onclick="startRoom(${r.id})">${isWaiting ? '开始对局' : '再来一局'}</button>`
                     : `<button class="btn btn-primary btn-sm" onclick="enterRoom(${r.id}, ${r.game_id ?? null})">进入观战</button>`}
                   <button class="btn btn-ghost btn-sm" onclick="deleteRoom(${r.id})">删除</button>
                 </div>
@@ -1491,6 +1494,13 @@
       if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> 开局中…'; }
       try {
         const res = await api(`/rooms/${state.game.room_id}/start`, { method: 'POST' });
+        // 导航前先彻底清理旧对局的 SSE 与状态，避免旧局(game_over)的延迟推送
+        // 覆盖新局，确保进入的是全新的一局而非终局棋盘。
+        if (state._es) { state._es.close(); state._es = null; }
+        state.game = null;
+        state.logs = [];
+        state.currentRoom = null;
+        state._boardKey = '';
         location.href = `#game/${res.game_id}`;
       } catch (e) {
         toast('重新开始失败: ' + e.message, 'error');
