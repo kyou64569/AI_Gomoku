@@ -1,0 +1,1574 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b101d" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='26' cy='32' r='22' fill='%23111827' stroke='%23e8b45a' stroke-width='2.5'/><circle cx='38' cy='32' r='22' fill='%23f8fafc' stroke='%23e8b45a' stroke-width='2.5' opacity='.92'/></svg>" />
+  <title>弈境 · AI 五子棋</title>
+  <style>
+    /* ============================================================
+       弈境 · AI 五子棋 — 设计系统
+       深邃棋盘 + 柔和琥珀高光，暗色高级质感
+       ============================================================ */
+    :root {
+      /* 色彩 Tokens */
+      --bg-0: #070b14;
+      --bg-1: #0c1220;
+      --bg-2: #121a2d;
+      --surface: #131c30;
+      --surface-2: #1a2540;
+      --surface-3: #223052;
+      --line: rgba(148, 163, 184, 0.13);
+      --line-strong: rgba(148, 163, 184, 0.26);
+      --text-1: #e9eef7;
+      --text-2: #9aa7bd;
+      --text-3: #5d6b84;
+      --amber: #e8b45a;
+      --amber-2: #f6cf85;
+      --amber-dim: rgba(232, 180, 90, 0.14);
+      --cyan: #6fd3ff;
+      --green: #3ddc97;
+      --red: #ff6b6b;
+      --danger-dim: rgba(255, 107, 107, 0.13);
+
+      /* 棋盘 Tokens */
+      --board-line: rgba(228, 190, 138, 0.30);
+      --board-star: rgba(240, 205, 155, 0.55);
+      --board-wood:
+        radial-gradient(130% 140% at 30% 0%, #473323 0%, #382614 45%, #27180c 78%, #180d05 100%);
+      --board-grain:
+        repeating-linear-gradient(93deg, rgba(0, 0, 0, 0.055) 0 1px, transparent 1px 5px),
+        repeating-linear-gradient(3deg, rgba(0, 0, 0, 0.03) 0 2px, transparent 2px 7px);
+
+      /* 间距 / 圆角 / 阴影 */
+      --radius: 16px;
+      --radius-sm: 10px;
+      --shadow-lg: 0 24px 48px -14px rgba(0, 0, 0, 0.62);
+      --shadow-md: 0 10px 24px -10px rgba(0, 0, 0, 0.55);
+      --shadow-glow: 0 0 0 1px rgba(232, 180, 90, 0.35), 0 6px 24px -6px rgba(232, 180, 90, 0.35);
+
+      /* 动效 */
+      --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+      --ease-spring: cubic-bezier(0.34, 1.4, 0.44, 1);
+      --font: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+      --font-mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { -webkit-text-size-adjust: 100%; }
+
+    body {
+      font-family: var(--font);
+      color: var(--text-1);
+      background:
+        radial-gradient(1200px 600px at 50% -10%, rgba(232, 180, 90, 0.10), transparent 60%),
+        radial-gradient(900px 500px at 85% 110%, rgba(111, 211, 255, 0.06), transparent 60%),
+        linear-gradient(180deg, var(--bg-1) 0%, var(--bg-0) 100%);
+      background-attachment: fixed;
+      min-height: 100vh;
+      overflow-x: hidden;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    #app { animation: pageIn 0.4s var(--ease-out) both; }
+    @keyframes pageIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+    ::selection { background: rgba(232, 180, 90, 0.30); }
+
+    /* ---------- 顶栏 ---------- */
+    .topbar {
+      position: sticky; top: 0; z-index: 40;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 12px clamp(14px, 4vw, 32px);
+      background: rgba(11, 16, 29, 0.72);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text-1); }
+    .brand-logo { position: relative; width: 34px; height: 34px; flex-shrink: 0; }
+    .brand-logo::before, .brand-logo::after {
+      content: ""; position: absolute; top: 50%; width: 24px; height: 24px; border-radius: 50%;
+      transform: translateY(-50%);
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5), inset 0 -2px 4px rgba(0, 0, 0, 0.4), inset 0 2px 3px rgba(255, 255, 255, 0.35);
+    }
+    .brand-logo::before { left: 1px; background: radial-gradient(circle at 32% 28%, #94a3b8, #0b1220 75%); }
+    .brand-logo::after { right: 1px; background: radial-gradient(circle at 32% 28%, #ffffff, #c9d3e0 75%); }
+    .brand-name { font-size: 18px; font-weight: 700; letter-spacing: 0.08em; }
+    .brand-name em { font-style: normal; color: var(--amber); }
+    .brand-sub { font-size: 10px; letter-spacing: 0.42em; color: var(--text-3); margin-top: 2px; text-transform: uppercase; }
+    .topbar-right { display: flex; align-items: center; gap: 10px; }
+    .game-chip {
+      font-size: 12px; color: var(--text-2); background: var(--surface);
+      border: 1px solid var(--line-strong); padding: 5px 12px; border-radius: 999px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ---------- 按钮 ---------- */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      font-family: inherit; font-size: 14px; font-weight: 600; line-height: 1;
+      padding: 11px 20px; border-radius: var(--radius-sm);
+      border: 1px solid transparent; cursor: pointer; white-space: nowrap;
+      transition: transform 0.16s var(--ease-out), box-shadow 0.16s var(--ease-out),
+                  background-color 0.16s, color 0.16s, border-color 0.16s, opacity 0.16s;
+      user-select: none; touch-action: manipulation;
+    }
+    .btn:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+    .btn:active { transform: scale(0.965); }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--amber-2), var(--amber) 55%, #d99a3d);
+      color: #241503;
+    }
+    .btn-primary:not(:disabled):hover { transform: translateY(-1px); box-shadow: var(--shadow-glow); }
+    .btn-ghost { background: var(--surface-2); color: var(--text-1); border-color: var(--line-strong); }
+    .btn-ghost:not(:disabled):hover { background: var(--surface-3); transform: translateY(-1px); box-shadow: var(--shadow-md); }
+    .btn-danger { background: var(--danger-dim); color: #ff9a9a; border-color: rgba(255, 107, 107, 0.35); }
+    .btn-danger:not(:disabled):hover { background: rgba(255, 107, 107, 0.22); transform: translateY(-1px); }
+    .btn-sm { padding: 8px 14px; font-size: 13px; }
+    .btn .spinner { width: 14px; height: 14px; border-width: 2px; }
+
+    /* ---------- 首页 ---------- */
+    .home-wrap { max-width: 980px; margin: 0 auto; padding: clamp(20px, 5vw, 48px) clamp(14px, 4vw, 32px) 64px; }
+    .hero { text-align: center; margin-bottom: clamp(22px, 4vw, 40px); }
+    .hero-title {
+      font-size: clamp(28px, 6vw, 44px); font-weight: 800; letter-spacing: 0.04em; line-height: 1.25;
+      background: linear-gradient(120deg, #fdf3de 0%, var(--amber-2) 40%, #b98a3f 100%);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .hero-sub { margin-top: 10px; color: var(--text-2); font-size: clamp(13px, 2.4vw, 15px); letter-spacing: 0.12em; }
+    .hero-chips { display: flex; justify-content: center; gap: 14px; margin-top: 18px; }
+    .hero-chips .chip { width: 26px; height: 26px; }
+
+    .chip { display: inline-block; width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5), inset 0 -2px 4px rgba(0, 0, 0, 0.35), inset 0 2px 3px rgba(255, 255, 255, 0.4); }
+    .chip-black { background: radial-gradient(circle at 32% 28%, #94a3b8, #0b1220 78%); }
+    .chip-white { background: radial-gradient(circle at 32% 28%, #ffffff, #c9d3e0 78%); }
+
+    .card {
+      background: linear-gradient(180deg, var(--surface) 0%, rgba(19, 28, 48, 0.72) 100%);
+      border: 1px solid var(--line); border-radius: var(--radius);
+      box-shadow: var(--shadow-md);
+    }
+    .card-head { padding: 18px 22px 0; display: flex; align-items: center; gap: 10px; }
+    .card-head h2 { font-size: 16px; font-weight: 700; letter-spacing: 0.06em; }
+    .card-head .hint { margin-left: auto; font-size: 12px; color: var(--text-3); }
+
+    .create-card { padding-bottom: 20px; margin-bottom: 28px; }
+    .create-body { padding: 18px 22px 0; }
+
+    .seg { display: inline-flex; background: var(--surface-2); border: 1px solid var(--line-strong);
+      border-radius: 12px; padding: 4px; gap: 4px; }
+    .seg-item {
+      border: 0; background: transparent; color: var(--text-2); font-family: inherit; font-size: 13.5px; font-weight: 600;
+      padding: 8px 18px; border-radius: 9px; cursor: pointer; transition: all 0.2s var(--ease-out);
+      display: inline-flex; align-items: center; gap: 7px; touch-action: manipulation;
+    }
+    .seg-item:hover { color: var(--text-1); }
+    .seg-item.active {
+      background: linear-gradient(135deg, var(--amber-2), var(--amber) 60%, #d99a3d);
+      color: #241503; box-shadow: 0 4px 14px -4px rgba(232, 180, 90, 0.5);
+    }
+
+    .seat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 18px; }
+    .seat {
+      background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: 12px;
+      padding: 14px; transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .seat:focus-within { border-color: rgba(232, 180, 90, 0.5); box-shadow: 0 0 0 3px var(--amber-dim); }
+    .seat-label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-3);
+      letter-spacing: 0.14em; margin-bottom: 9px; font-weight: 600; }
+    .seat select, .field select, .input, .select {
+      width: 100%; background: #0e1526; color: var(--text-1);
+      border: 1px solid var(--line-strong); border-radius: 9px;
+      padding: 9px 12px; font-family: inherit; font-size: 14px; outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .seat select:focus, .field select:focus, .input:focus, .select:focus {
+      border-color: rgba(232, 180, 90, 0.55); box-shadow: 0 0 0 3px var(--amber-dim);
+    }
+    .create-actions { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+    .create-hint { font-size: 12px; color: var(--text-3); margin-top: 12px; }
+
+    .rooms-section h2 { font-size: 15px; letter-spacing: 0.1em; color: var(--text-2); margin-bottom: 12px; font-weight: 700; }
+    .room-list { display: flex; flex-direction: column; gap: 10px; }
+    .room-card {
+      display: flex; align-items: center; gap: 14px; padding: 14px 18px;
+      background: linear-gradient(180deg, var(--surface) 0%, rgba(19, 28, 48, 0.66) 100%);
+      border: 1px solid var(--line); border-radius: 12px;
+      transition: transform 0.18s var(--ease-out), border-color 0.18s, box-shadow 0.18s;
+    }
+    .room-card:hover { transform: translateY(-2px); border-color: var(--line-strong); box-shadow: var(--shadow-md); }
+    .room-info { flex: 1; min-width: 0; }
+    .room-title { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 14.5px; }
+    .room-meta { margin-top: 5px; font-size: 12.5px; color: var(--text-3); display: flex; gap: 14px; flex-wrap: wrap; }
+    .room-actions { display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 700;
+      padding: 3px 10px; border-radius: 999px; letter-spacing: 0.05em;
+    }
+    .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .badge-waiting { background: var(--amber-dim); color: var(--amber); }
+    .badge-playing { background: rgba(111, 211, 255, 0.13); color: var(--cyan); }
+    .badge-finished { background: rgba(148, 163, 184, 0.13); color: var(--text-2); }
+    .badge-mode { background: var(--surface-3); color: var(--text-2); }
+    .badge-mode::before { display: none; }
+
+    .empty { text-align: center; color: var(--text-3); font-size: 13.5px; padding: 34px 0 10px; }
+    .empty-emoji { font-size: 30px; display: block; margin-bottom: 10px; opacity: 0.8; }
+
+    /* ---------- 对局页 ---------- */
+    .game-layout {
+      max-width: 1160px; margin: 0 auto; padding: clamp(14px, 3vw, 26px) clamp(12px, 3vw, 30px) 56px;
+      display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: clamp(16px, 2.5vw, 26px);
+      align-items: start;
+    }
+    .game-main { min-width: 0; }
+
+    .playerbar {
+      display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      gap: 12px; align-items: center; margin-bottom: 16px;
+    }
+    .player-card {
+      display: flex; align-items: center; gap: 11px; padding: 11px 14px;
+      background: var(--surface); border: 1px solid var(--line); border-radius: 13px;
+      min-width: 0; transition: border-color 0.25s, box-shadow 0.25s, background 0.25s;
+    }
+    .player-card .p-name { font-weight: 700; font-size: 14.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .player-card .p-role { font-size: 11px; color: var(--text-3); letter-spacing: 0.1em; margin-top: 2px; }
+    .player-card.active {
+      border-color: rgba(232, 180, 90, 0.6); background: linear-gradient(180deg, #1e2a47, var(--surface));
+      box-shadow: 0 0 0 3px var(--amber-dim), var(--shadow-md);
+    }
+    .player-card .p-status { margin-left: auto; display: none; }
+    .player-card.active .p-status { display: block; }
+
+    .turn-badge {
+      text-align: center; font-size: 12.5px; font-weight: 700; color: var(--amber);
+      letter-spacing: 0.08em; white-space: nowrap;
+      display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 0 2px;
+    }
+    .turn-badge .tb-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--amber);
+      box-shadow: 0 0 10px 1px rgba(232, 180, 90, 0.75);
+      animation: blink 1.4s ease-in-out infinite;
+    }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+    .spinner {
+      width: 15px; height: 15px; border-radius: 50%;
+      border: 2px solid rgba(232, 180, 90, 0.25); border-top-color: var(--amber);
+      animation: spin 0.8s linear infinite; flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* 棋盘 */
+    .board-wrap { position: relative; }
+    .board-frame {
+      background: linear-gradient(155deg, #31200f 0%, #1d1207 55%, #140b04 100%);
+      border: 1px solid rgba(232, 180, 90, 0.14);
+      padding: clamp(8px, 1.8vw, 14px); border-radius: 18px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), var(--shadow-lg);
+    }
+    .board-grid {
+      display: grid; grid-template-columns: repeat(15, 1fr);
+      aspect-ratio: 1 / 1; width: 100%;
+      border-radius: 6px; overflow: hidden;
+      background-color: #1d1108;
+      background-image:
+        linear-gradient(to right, var(--board-line) 1px, transparent 1px),
+        linear-gradient(to bottom, var(--board-line) 1px, transparent 1px),
+        var(--board-grain),
+        var(--board-wood);
+      background-size: calc(100% / 15) 100%, 100% calc(100% / 15), auto, auto;
+      background-repeat: repeat, repeat, repeat, no-repeat;
+      user-select: none; -webkit-user-select: none;
+    }
+    .board-cell {
+      position: relative; aspect-ratio: 1 / 1; min-width: 0;
+      transition: background-color 0.18s;
+    }
+    .board-cell::before, .board-cell::after { pointer-events: none; }
+    /* 星位 */
+    .board-cell.star::after {
+      content: ""; position: absolute; left: 50%; top: 50%; width: 11%; height: 11%;
+      transform: translate(-50%, -50%); border-radius: 50%;
+      background: var(--board-star);
+      box-shadow: 0 0 4px rgba(240, 205, 155, 0.35);
+    }
+    /* 悬停幽灵子 */
+    .board-grid.turn-1 .board-cell:not(.has-stone):hover::before,
+    .board-grid.turn-2 .board-cell:not(.has-stone):hover::before {
+      content: ""; position: absolute; inset: 5%; border-radius: 50%; opacity: 0.42;
+      transition: opacity 0.15s;
+    }
+    .board-grid.turn-1 .board-cell:not(.has-stone):hover::before {
+      background: radial-gradient(circle at 32% 28%, #8b98ab, #0b1220 78%);
+    }
+    .board-grid.turn-2 .board-cell:not(.has-stone):hover::before {
+      background: radial-gradient(circle at 32% 28%, #ffffff, #c3cedd 78%);
+    }
+    .board-grid.turn-1 .board-cell:not(.has-stone):hover,
+    .board-grid.turn-2 .board-cell:not(.has-stone):hover { background-color: rgba(255, 255, 255, 0.05); cursor: pointer; }
+    .board-grid.ai-turn .board-cell { cursor: not-allowed; }
+    .board-grid.no-ghost .board-cell { cursor: default; }
+
+    /* 棋子 */
+    .stone {
+      position: absolute; inset: 5%; border-radius: 50%; will-change: transform;
+      box-shadow: 0 3px 7px rgba(0, 0, 0, 0.55), inset 0 -3px 5px rgba(0, 0, 0, 0.35), inset 0 2px 3px rgba(255, 255, 255, 0.28);
+    }
+    .stone--black { background: radial-gradient(circle at 32% 26%, #a3b0c2 0%, #4b5563 18%, #1f2937 55%, #05070d 100%); }
+    .stone--white { background: radial-gradient(circle at 32% 26%, #ffffff 0%, #f1f5f9 32%, #cbd5e1 62%, #8b98ab 100%); }
+
+    /* 落子动画 */
+    .stone--new { animation: stoneDrop 0.34s var(--ease-spring) both; }
+    .stone--new::after {
+      content: ""; position: absolute; inset: -8%; border-radius: 50%;
+      border: 2px solid rgba(232, 180, 90, 0.75);
+      animation: stoneRing 0.5s ease-out forwards;
+    }
+    @keyframes stoneDrop {
+      0% { transform: translateY(-16px) scale(0.35); opacity: 0; }
+      60% { transform: translateY(2px) scale(1.07); opacity: 1; }
+      80% { transform: translateY(-1px) scale(0.985); }
+      100% { transform: translateY(0) scale(1); }
+    }
+    @keyframes stoneRing { from { transform: scale(0.55); opacity: 0.95; } to { transform: scale(1.45); opacity: 0; } }
+
+    /* 最近一步标记 */
+    .stone--last::before {
+      content: ""; position: absolute; left: 50%; top: 50%; width: 30%; height: 30%;
+      transform: translate(-50%, -50%); border-radius: 50%;
+      box-shadow: 0 0 10px 2px rgba(255, 255, 255, 0.35);
+    }
+    .stone--black.stone--last::before { background: #f5c453; box-shadow: 0 0 12px 2px rgba(245, 196, 83, 0.8); }
+    .stone--white.stone--last::before { background: #0f172a; box-shadow: 0 0 12px 2px rgba(15, 23, 42, 0.55); }
+
+    /* 获胜连线 */
+    .stone--win { animation: winPulse 1.3s ease-in-out infinite; }
+    @keyframes winPulse {
+      0%, 100% { box-shadow: 0 3px 7px rgba(0,0,0,.55), inset 0 -3px 5px rgba(0,0,0,.35), inset 0 2px 3px rgba(255,255,255,.28), 0 0 10px 2px rgba(232,180,90,.55); }
+      50% { box-shadow: 0 3px 7px rgba(0,0,0,.55), inset 0 -3px 5px rgba(0,0,0,.35), inset 0 2px 3px rgba(255,255,255,.28), 0 0 22px 7px rgba(232,180,90,.95); }
+    }
+
+    /* 结果浮层 */
+    .result-overlay {
+      position: absolute; inset: 0; z-index: 20; border-radius: 18px;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(7, 11, 20, 0.55);
+      backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
+      animation: fadeIn 0.3s var(--ease-out) both;
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .result-card {
+      text-align: center; padding: 28px 34px; border-radius: 18px;
+      background: linear-gradient(180deg, #1b2540, #121a2d);
+      border: 1px solid rgba(232, 180, 90, 0.35);
+      box-shadow: var(--shadow-lg);
+      animation: cardPop 0.4s var(--ease-spring) both;
+      max-width: min(88%, 320px);
+    }
+    @keyframes cardPop { from { opacity: 0; transform: scale(0.8) translateY(14px); } to { opacity: 1; transform: none; } }
+    .result-icon { font-size: 40px; line-height: 1; margin-bottom: 10px; }
+    .result-title { font-size: clamp(20px, 4vw, 26px); font-weight: 800; letter-spacing: 0.06em;
+      background: linear-gradient(120deg, #fdf3de, var(--amber-2) 50%, #d99a3d);
+      -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .result-sub { font-size: 12.5px; color: var(--text-3); margin: 8px 0 18px; }
+    .result-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+
+    /* 控制按钮行 */
+    .game-controls { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+
+    /* 侧栏 */
+    .side-panel { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 76px; }
+    .panel-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    .panel-head { padding: 13px 16px; font-size: 13px; font-weight: 700; letter-spacing: 0.1em; color: var(--text-2);
+      border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
+    .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); }
+    .stat-item { background: var(--surface-2); padding: 12px 14px; }
+    .stat-label { font-size: 11px; color: var(--text-3); letter-spacing: 0.1em; margin-bottom: 4px; }
+    .stat-value { font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 7px; }
+    .stat-value .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .dot-black { background: radial-gradient(circle at 32% 28%, #94a3b8, #0b1220 78%); }
+    .dot-white { background: radial-gradient(circle at 32% 28%, #fff, #c9d3e0 78%); }
+    .dot-amber { background: var(--amber); box-shadow: 0 0 8px rgba(232, 180, 90, 0.8); }
+
+    .log-list { max-height: 420px; overflow-y: auto; padding: 10px 14px; scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent; }
+    .log-list::-webkit-scrollbar { width: 6px; }
+    .log-list::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
+    .log-entry {
+      font-size: 12px; color: var(--text-2); line-height: 1.5;
+      padding: 6px 0; border-bottom: 1px dashed rgba(148, 163, 184, 0.12);
+      word-break: break-all;
+    }
+    .log-entry:last-child { border-bottom: 0; }
+    .log-empty { font-size: 12.5px; color: var(--text-3); padding: 16px 14px; text-align: center; }
+
+    /* ---------- 配置页 ---------- */
+    .config-wrap { max-width: 880px; margin: 0 auto; padding: clamp(20px, 4vw, 36px) clamp(14px, 4vw, 30px) 64px;
+      display: flex; flex-direction: column; gap: 24px; }
+    .config-sec { padding: 20px 22px 24px; }
+    .config-sec h3 { font-size: 16px; font-weight: 700; letter-spacing: 0.05em; display: flex; align-items: center; gap: 9px; }
+    .config-sec h3 .num { width: 22px; height: 22px; border-radius: 7px; background: var(--amber-dim); color: var(--amber);
+      display: inline-flex; align-items: center; justify-content: center; font-size: 12px; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+    .form-grid .full { grid-column: 1 / -1; }
+    .field label { display: block; font-size: 12px; color: var(--text-3); margin-bottom: 6px; letter-spacing: 0.08em; }
+    .range-row { display: flex; align-items: center; gap: 10px; }
+    .range-row input[type="range"] { flex: 1; accent-color: var(--amber); }
+    .range-val { font-size: 12.5px; color: var(--amber); font-weight: 700; min-width: 26px; text-align: right; font-variant-numeric: tabular-nums; }
+    .cfg-list, .player-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+    .cfg-card, .player-card-row {
+      background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px;
+      padding: 14px 16px; transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .cfg-card.selected { border-color: rgba(232, 180, 90, 0.55); box-shadow: 0 0 0 3px var(--amber-dim); }
+    .cfg-card .row1 { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+    .cfg-card .cname { font-weight: 700; font-size: 14.5px; }
+    .cfg-card .curl { font-size: 12px; color: var(--text-3); margin-top: 3px; font-family: var(--font-mono); word-break: break-all; }
+    .cfg-card .cmodels { margin-top: 10px; font-size: 12px; color: var(--text-2); }
+    .cfg-card .cmodels b { color: var(--green); font-weight: 600; }
+    .cfg-actions, .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .player-card-row .prow { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .player-card-row .pname { font-weight: 700; font-size: 14.5px; }
+    .player-card-row .pmeta { font-size: 12px; color: var(--text-3); margin-top: 3px; font-family: var(--font-mono); }
+    .edit-box { margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line-strong); }
+    .edit-box .form-grid { margin-top: 12px; }
+    .config-hint { margin-top: 18px; padding: 13px 16px; background: var(--surface-2); border: 1px dashed var(--line-strong);
+      border-radius: 11px; font-size: 12.5px; color: var(--text-3); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .config-hint a { text-decoration: none; }
+
+    /* ---------- 弹窗 ---------- */
+    .modal-overlay {
+      position: fixed; inset: 0; z-index: 1000;
+      background: rgba(5, 8, 16, 0.68);
+      backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+      opacity: 0; transition: opacity 0.22s var(--ease-out);
+    }
+    .modal-overlay.open { opacity: 1; }
+    .modal-card {
+      width: 100%; max-width: 400px; max-height: min(84vh, 640px); overflow-y: auto;
+      background: linear-gradient(180deg, #1b2540, #121a2d);
+      border: 1px solid var(--line-strong); border-radius: 16px; box-shadow: var(--shadow-lg);
+      padding: 22px; transform: scale(0.92) translateY(12px); transition: transform 0.25s var(--ease-spring);
+    }
+    .modal-overlay.open .modal-card { transform: none; }
+    .modal-title { font-size: 17px; font-weight: 800; letter-spacing: 0.05em; margin-bottom: 6px; }
+    .modal-message { font-size: 13.5px; color: var(--text-2); line-height: 1.65; margin-bottom: 16px; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+    .modal-pre {
+      background: #0c1322; border: 1px solid var(--line); border-radius: 10px;
+      padding: 12px; font-size: 12px; font-family: var(--font-mono); color: var(--cyan);
+      max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all; margin-top: 8px;
+    }
+
+    /* ---------- Toast ---------- */
+    #toast-container { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 1100;
+      display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: none; width: min(92vw, 420px); }
+    .toast {
+      padding: 11px 18px; border-radius: 12px; font-size: 13.5px; font-weight: 600;
+      background: var(--surface-2); color: var(--text-1); border: 1px solid var(--line-strong);
+      box-shadow: var(--shadow-md); display: flex; align-items: center; gap: 9px;
+      opacity: 0; transform: translateY(-10px) scale(0.96);
+      transition: opacity 0.25s var(--ease-out), transform 0.25s var(--ease-out);
+      max-width: 100%;
+    }
+    .toast.show { opacity: 1; transform: none; }
+    .toast::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--amber); flex-shrink: 0; }
+    .toast--error::before { background: var(--red); }
+    .toast--success::before { background: var(--green); }
+    .toast--info::before { background: var(--amber); }
+
+    /* ---------- 响应式 ---------- */
+    @media (max-width: 1023px) {
+      .game-layout { grid-template-columns: 1fr; }
+      .side-panel { position: static; }
+      .log-list { max-height: 220px; }
+    }
+    @media (max-width: 640px) {
+      .seat-grid { grid-template-columns: 1fr; }
+      .form-grid { grid-template-columns: 1fr; }
+      .playerbar { grid-template-columns: 1fr; gap: 8px; }
+      .turn-badge { order: -1; flex-direction: row; justify-content: center; padding: 4px 0 2px; }
+      .brand-sub { display: none; }
+      .room-card { flex-direction: column; align-items: stretch; }
+      .room-actions { justify-content: flex-start; }
+      .modal-actions { flex-direction: column-reverse; }
+      .modal-actions .btn { width: 100%; }
+    }
+
+    /* ---------- 无障碍：减少动效 ---------- */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toast-container" aria-live="polite"></div>
+
+  <script>
+    const API = '/api';
+    let state = {
+      configs: [],
+      players: [],
+      rooms: [],
+      game: null,
+      currentRoom: null,
+      logs: [],
+      mode: 'pve',
+      black: 0,
+      white: 0,
+      selectedConfigId: null,
+      humanRole: null, // 'black' | 'white' | null
+      editingPlayerId: null, // 正在编辑的 AI 玩家 id
+      _moving: false,
+      _boardKey: '', // 上一帧棋盘 JSON，用于识别"新落子"以触发动画
+    };
+
+    async function api(path, opts = {}) {
+      const res = await fetch(API + path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    /* ================= 安全：HTML 转义 ================= */
+    // 所有用户/LLM 提供的文本在拼进 innerHTML 前必须先转义，
+    // 防止存储型 XSS（玩家名/配置名/base_url，以及 LLM 返回的 reason 经日志渲染）。
+    function escapeHtml(s) {
+      if (s === null || s === undefined) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    /* ================= 轻提示 / 弹窗 ================= */
+    function toast(msg, type = 'info') {
+      const box = document.getElementById('toast-container');
+      const el = document.createElement('div');
+      el.className = `toast toast--${type}`;
+      el.textContent = msg;
+      box.appendChild(el);
+      requestAnimationFrame(() => el.classList.add('show'));
+      setTimeout(() => {
+        el.classList.remove('show');
+        setTimeout(() => el.remove(), 300);
+      }, 2600);
+    }
+
+    // 通用弹窗：resolve(结果对象) 或 resolve(null)（取消）
+    function showModal({ title, message, bodyHTML, confirmText = '确定', cancelText = '取消', danger = false }) {
+      return new Promise(resolve => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.setAttribute('role', 'dialog');
+        overlay.setAttribute('aria-modal', 'true');
+        overlay.innerHTML = `
+          <div class="modal-card">
+            <div class="modal-title">${title}</div>
+            ${message ? `<div class="modal-message">${message}</div>` : ''}
+            ${bodyHTML ? `<div class="modal-body">${bodyHTML}</div>` : ''}
+            <div class="modal-actions">
+              <button class="btn btn-ghost" data-act="cancel">${cancelText}</button>
+              <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-act="ok">${confirmText}</button>
+            </div>
+          </div>`;
+        document.body.appendChild(overlay);
+        requestAnimationFrame(() => requestAnimationFrame(() => overlay.classList.add('open')));
+        function close(val) {
+          overlay.classList.remove('open');
+          setTimeout(() => overlay.remove(), 240);
+          resolve(val);
+        }
+        overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
+        overlay.querySelector('[data-act=cancel]').addEventListener('click', () => close(null));
+        overlay.querySelector('[data-act=ok]').addEventListener('click', () => {
+          const result = {};
+          overlay.querySelectorAll('[data-field]').forEach(el => { result[el.dataset.field] = el.value; });
+          close(result);
+        });
+        // 回车确认
+        overlay.querySelectorAll('input').forEach(inp => inp.addEventListener('keydown', e => {
+          if (e.key === 'Enter') overlay.querySelector('[data-act=ok]').click();
+        }));
+        const first = overlay.querySelector('input, select');
+        if (first) setTimeout(() => first.focus(), 60);
+      });
+    }
+
+    // 字段表单弹窗：fields = [{id,label,type,placeholder,value,options}]
+    function promptFields({ title, fields }) {
+      const body = fields.map(f => {
+        let control;
+        if (f.type === 'range') {
+          control = `
+            <div class="range-row">
+              <input data-field="${f.id}" type="range" min="0" max="100" value="${f.value ?? 50}"
+                     oninput="this.nextElementSibling.textContent=this.value" />
+              <span class="range-val">${f.value ?? 50}</span>
+            </div>`;
+        } else if (f.options && f.options.length) {
+          // options 支持字符串或 {value, label} 对象
+          control = `<select data-field="${f.id}">${f.options.map(o =>
+            typeof o === 'object' ? `<option value="${o.value}">${o.label}</option>` : `<option value="${o}">${o}</option>`
+          ).join('')}</select>`;
+        } else {
+          control = `<input data-field="${f.id}" type="${f.type || 'text'}" placeholder="${f.placeholder || ''}" value="${f.value || ''}" />`;
+        }
+        return `<div class="field"><label>${f.label}</label>${control}</div>`;
+      }).join('');
+      return showModal({ title, bodyHTML: `<div class="form-grid" style="grid-template-columns:1fr">${body}</div>` });
+    }
+
+    function showResultModal(title, text) {
+      return showModal({ title, bodyHTML: `<div class="modal-pre">${text}</div>`, confirmText: '知道了', cancelText: '' });
+    }
+
+    async function confirmDanger(title, message, confirmText = '删除') {
+      const res = await showModal({ title, message, confirmText, danger: true });
+      return res !== null;
+    }
+
+    /* ================= 数据加载 ================= */
+    async function loadConfigs() {
+      state.configs = await api('/configs/');
+      state.players = await api('/players/');
+      render();
+    }
+
+    async function loadRooms() {
+      state.rooms = await api('/rooms/');
+      render();
+    }
+
+    // 思考等级显示文案
+    function effortLabel(v) {
+      if (!v) return '默认';
+      return ({ low: '低', medium: '中', high: '高' })[v] || v;
+    }
+
+    async function createConfig() {
+      const res = await promptFields({ title: '添加模型配置', fields: [
+        { id: 'name', label: '配置名称', placeholder: '例如：DeepSeek' },
+        { id: 'base_url', label: 'Base URL', placeholder: 'https://api.example.com/v1' },
+        { id: 'api_key', label: 'API Key', type: 'password' },
+      ]});
+      if (!res) return;
+      if (!res.name || !res.base_url || !res.api_key) return toast('请填写完整配置信息', 'error');
+      await api('/configs/', { method: 'POST', body: JSON.stringify({ name: res.name, base_url: res.base_url, api_key: res.api_key, models: [] }) });
+      toast('模型配置已添加', 'success');
+      await loadConfigs();
+    }
+
+    async function testConfig(id) {
+      const res = await api(`/configs/${id}/test`, { method: 'POST' });
+      await showResultModal('测试结果', JSON.stringify(res, null, 2));
+    }
+
+    async function fetchModels(id) {
+      try {
+        const res = await api(`/configs/${id}/models`, { method: 'POST' });
+        const config = state.configs.find(c => c.id === id);
+        if (config) {
+          config.models = res.models || [];
+          state.selectedConfigId = id;
+          render();
+          toast(`拉取到 ${(res.models || []).length} 个模型`, 'success');
+        }
+      } catch (e) {
+        toast('拉取失败: ' + e.message, 'error');
+      }
+    }
+
+    async function deleteConfig(id) {
+      const ok = await confirmDanger('删除模型配置', '确定删除该配置吗？该操作不可恢复。');
+      if (!ok) return;
+      await api(`/configs/${id}`, { method: 'DELETE' });
+      toast('配置已删除', 'success');
+      await loadConfigs();
+    }
+
+    async function createPlayer() {
+      const modelConfigId = state.selectedConfigId || (state.configs.length > 0 ? state.configs[0].id : null);
+      if (!modelConfigId) return toast('请先在配置页添加模型配置', 'error');
+      const config = state.configs.find(c => c.id === modelConfigId);
+      const models = config?.models || [];
+      const res = await promptFields({ title: '添加 AI 玩家', fields: [
+        { id: 'name', label: '玩家名称', placeholder: '例如：Alpha 弈' },
+        models.length
+          ? { id: 'model_id', label: '模型', options: models }
+          : { id: 'model_id', label: '模型 ID', placeholder: '请输入模型 ID' },
+        { id: 'reasoning_effort', label: '思考等级', options: [
+          { value: '', label: '默认（不设置）' },
+          { value: 'low', label: '低' },
+          { value: 'medium', label: '中' },
+          { value: 'high', label: '高' },
+        ]},
+      ]});
+      if (!res) return;
+      if (!res.name || !res.model_id) return toast('请填写玩家名称与模型', 'error');
+      await api('/players/', { method: 'POST', body: JSON.stringify({ name: res.name, model_config_id: modelConfigId, model_id: res.model_id, reasoning_effort: res.reasoning_effort || '' }) });
+      toast('AI 玩家已创建', 'success');
+      await loadConfigs();
+    }
+
+    async function deletePlayer(id) {
+      const ok = await confirmDanger('删除 AI 玩家', '确定删除该玩家吗？该操作不可恢复。');
+      if (!ok) return;
+      await api(`/players/${id}`, { method: 'DELETE' });
+      toast('玩家已删除', 'success');
+      await loadConfigs();
+    }
+
+    function switchMode() {
+      // 切到观战模式时，若之前选了"玩家自己"则清空（观战不能选玩家）
+      if (state.mode === 'watch') {
+        if (state.black === 'human') state.black = '';
+        if (state.white === 'human') state.white = '';
+      }
+      render();
+    }
+
+    async function createRoom() {
+      if (!state.black || !state.white) return toast('请先为黑白双方选择玩家', 'error');
+      if (state.black === '0' || state.white === '0') return toast('请先为黑白双方选择玩家', 'error');
+      const isHumanBlack = state.black === 'human';
+      const isHumanWhite = state.white === 'human';
+      const humanCount = (isHumanBlack ? 1 : 0) + (isHumanWhite ? 1 : 0);
+      if (state.mode === 'pve' && humanCount !== 1) {
+        return toast('人机模式：必须选择一位"玩家自己" + 一位 AI', 'error');
+      }
+      if (state.mode === 'watch' && humanCount > 0) {
+        return toast('观战模式：双方均为 AI，不能选择"玩家自己"', 'error');
+      }
+      const seats = [
+        { player_id: isHumanBlack ? null : Number(state.black), role: 'black' },
+        { player_id: isHumanWhite ? null : Number(state.white), role: 'white' }
+      ];
+      try {
+        const room = await api('/rooms/', { method: 'POST', body: JSON.stringify({ mode: state.mode, seats }) });
+        toast('房间创建成功', 'success');
+        // 创建后立即开新局并进入对局页（创建接口的响应不含 game_id，故显式 start）
+        await startRoom(room.id);
+      } catch (e) {
+        toast('创建失败: ' + e.message, 'error');
+      }
+    }
+
+    async function startRoom(id) {
+      const res = await api(`/rooms/${id}/start`, { method: 'POST' });
+      await loadRooms();
+      location.href = `#game/${res.game_id}`;
+    }
+
+    // 进入房间：若已有对局直接进入；waiting 房间则先开始再进入
+    async function enterRoom(id, gameId) {
+      try {
+        if (gameId) {
+          location.href = `#game/${gameId}`;
+          return;
+        }
+        await startRoom(id);
+      } catch (e) {
+        toast('进入失败: ' + e.message, 'error');
+      }
+    }
+
+    async function deleteRoom(id) {
+      const ok = await confirmDanger('删除房间', '确定删除这个房间吗？关联对局记录将一并删除。');
+      if (!ok) return;
+      try {
+        await api(`/rooms/${id}`, { method: 'DELETE' });
+        toast('房间已删除', 'success');
+        await loadRooms();
+      } catch (e) {
+        toast('删除失败: ' + e.message, 'error');
+      }
+    }
+
+    /* ================= 音效 ================= */
+    let _audioCtx = null;
+    let _lastSound = { stones: -1, role: 0 };
+
+    // 落子音效：用 WebAudio 合成短促"嗒"声，黑子低音、白子高音，无需外部音频文件
+    function playStoneSound(role, stones) {
+      try {
+        if (stones !== undefined && _lastSound.stones === stones) return; // 同一手不重复
+        _lastSound = { stones, role };
+        if (!_audioCtx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) return;
+          _audioCtx = new AC();
+        }
+        if (_audioCtx.state === 'suspended') _audioCtx.resume();
+        const ctx = _audioCtx;
+        const t0 = ctx.currentTime;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        // 黑子 150Hz 低音，白子 300Hz 高音
+        osc.frequency.setValueAtTime(role === 1 ? 150 : 300, t0);
+        gain.gain.setValueAtTime(0.6, t0);
+        gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.18);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(t0);
+        osc.stop(t0 + 0.2);
+      } catch (e) {
+        /* 音频不可用时静默忽略 */
+      }
+    }
+
+    /* ================= 对局加载 / SSE ================= */
+    async function loadGame(gameId) {
+      if (state._es) {
+        state._es.close();
+        state._es = null;
+      }
+      if (!gameId || isNaN(gameId)) {
+        toast('无效的对局ID', 'error');
+        location.href = '/';
+        return;
+      }
+      try {
+        if (state.players.length === 0) {
+          state.players = await api('/players/');
+        }
+        if (state.rooms.length === 0) {
+          state.rooms = await api('/rooms/');
+        }
+        const game = await api(`/games/${gameId}/state`);
+        state.game = game;
+        state.logs = game.logs || [];
+        state._boardKey = ''; // 新对局：棋盘整体重置，不触发落子动画
+        state.currentRoom = state.rooms.find(r => r.id === game.room_id);
+        // 如果缓存里没找到该房间，刷新房间列表再试一次
+        if (!state.currentRoom) {
+          state.rooms = await api('/rooms/');
+          state.currentRoom = state.rooms.find(r => r.id === game.room_id);
+        }
+        state.humanRole = null;
+        if (state.currentRoom && state.currentRoom.mode === 'pve') {
+          const seats = Array.isArray(state.currentRoom.seats) ? state.currentRoom.seats : JSON.parse(state.currentRoom.seats || '[]');
+          const humanSeat = seats.find(s => s.player_id === null || s.player_id === 0 || s.player_id === 'human');
+          if (humanSeat) {
+            state.humanRole = humanSeat.role;
+          } else {
+            // 兜底：从历史记录推断人类角色
+            const firstMove = game.history?.[0];
+            const secondMove = game.history?.[1];
+            if (firstMove && firstMove.player_name === 'Player') {
+              state.humanRole = firstMove.player === 1 ? 'black' : 'white';
+            } else if (secondMove && secondMove.player_name === 'Player') {
+              state.humanRole = secondMove.player === 1 ? 'black' : 'white';
+            }
+          }
+        }
+        state.mode = state.currentRoom ? state.currentRoom.mode : 'pve';
+        // 确保数据就绪后立即渲染一次
+        render();
+      } catch (e) {
+        toast('加载对局失败: ' + e.message, 'error');
+        location.href = '/';
+        return;
+      }
+      connectSSE(gameId, 0);
+    }
+
+    function connectSSE(gameId, attempt) {
+      // 清理旧连接
+      if (state._es) {
+        try { state._es.close(); } catch (_) {}
+        state._es = null;
+      }
+      const es = new EventSource(`/api/games/${gameId}/stream`);
+      state._es = es;
+      state._es.gameId = gameId;
+      console.log(`[SSE] connecting attempt=${attempt}`);
+      es.onopen = () => {
+        console.log('[SSE] open');
+        attempt = 0;  // 连上后清零重试计数
+      };
+      es.addEventListener('game_update', e => {
+        try {
+          const data = JSON.parse(e.data);
+          const prevStoneCount = (state.game?.board || []).reduce((s, r) => s + r.filter(c => c !== 0).length, 0);
+          state.game = { ...state.game, ...data };
+          state._aiPending = !!data.ai_pending;
+          const nextStoneCount = (state.game?.board || []).reduce((s, r) => s + r.filter(c => c !== 0).length, 0);
+          if (data.logs) state.logs = data.logs;
+          // 落子音效：石头数增加说明有新落子；根据更新后的 turn 推断刚才是谁落的
+          if (nextStoneCount > prevStoneCount) {
+            const lastMoveRole = data.turn === 1 ? 2 : 1; // 落子后 turn 切换，刚落的是另一方
+            playStoneSound(lastMoveRole, nextStoneCount);
+          }
+          render().catch(err => console.error('[render] error', err));
+        } catch (err) {
+          console.error('[SSE] parse error', err, e.data);
+        }
+      });
+      es.addEventListener('game_over', e => {
+        console.log('[SSE] game_over', e.data);
+        try {
+          const data = JSON.parse(e.data);
+          state.game.status = data.status;
+          state.game.winner = data.winner;
+          state._aiPending = false;
+          render().catch(err => console.error('[render] error', err));
+        } catch (err) {
+          console.error('[SSE] game_over parse error', err);
+        }
+        es.close();  // 已结束，不重连
+      });
+      es.onerror = (e) => {
+        console.error('[SSE] onerror', e, 'readyState=', es.readyState);
+        // 终局状态就不重连
+        if (state.game && (state.game.status === 'finished' || state.game.status === 'draw')) return;
+        if (es.readyState === EventSource.CLOSED) {
+          const delay = Math.min(1000 * Math.pow(1.6, attempt), 10000);
+          attempt += 1;
+          console.log(`[SSE] CLOSED, reconnecting in ${Math.round(delay)}ms (attempt ${attempt})`);
+          setTimeout(() => connectSSE(gameId, attempt), delay);
+        }
+      };
+    }
+
+    /* ================= 落子 ================= */
+    async function makeMove(row, col) {
+      if (state.mode === 'watch') return;
+      if (!state.game || state.game.status !== 'playing') return;
+      if (state._moving) return;
+      const isHumanBlack = state.humanRole === 'black';
+      const isHumanWhite = state.humanRole === 'white';
+      const isMyTurn = (state.game.turn === 1 && isHumanBlack) || (state.game.turn === 2 && isHumanWhite);
+      if (!isMyTurn) return;
+      state._moving = true;
+      try {
+        const res = await api(`/games/${state.game.id}/move`, { method: 'POST', body: JSON.stringify({ row, col }) });
+        // 乐观更新：立即在棋盘上放置棋子并切换回合，不用等 SSE
+        const myStone = state.game.turn; // 1 或 2
+        const newBoard = state.game.board.map((r, ri) => r.map((c, ci) => (ri === row && ci === col ? myStone : c)));
+        const stoneCount = newBoard.reduce((s, r) => s + r.filter(c => c !== 0).length, 0);
+        state.game = { ...state.game, board: newBoard, turn: 3 - myStone };
+        playStoneSound(myStone, stoneCount); // 人类落子音效
+        render();
+      } catch (e) {
+        console.error('[makeMove] error', e);
+        toast('落子失败: ' + e.message, 'error');
+      } finally {
+        state._moving = false;
+      }
+    }
+
+    /* ================= 棋盘渲染 ================= */
+    // 找出获胜五连（返回坐标数组），用于高亮
+    function findWinLine(board, player) {
+      const dirs = [[0, 1], [1, 0], [1, 1], [1, -1]];
+      for (let r = 0; r < 15; r++) {
+        for (let c = 0; c < 15; c++) {
+          if (board[r][c] !== player) continue;
+          for (const [dr, dc] of dirs) {
+            const cells = [[r, c]];
+            for (let k = 1; k < 5; k++) {
+              const nr = r + dr * k, nc = c + dc * k;
+              if (nr < 0 || nr >= 15 || nc < 0 || nc >= 15 || board[nr][nc] !== player) break;
+              cells.push([nr, nc]);
+            }
+            if (cells.length === 5) return cells;
+          }
+        }
+      }
+      return null;
+    }
+
+    function isStarCell(r, c) {
+      return ((r === 3 || r === 11) && (c === 3 || c === 11)) || (r === 7 && c === 7);
+    }
+
+    function renderBoard() {
+      const board = state.game?.board || Array.from({ length: 15 }, () => Array(15).fill(0));
+      const playing = state.game?.status === 'playing';
+      const isAiTurn = playing && state.humanRole && (
+        (state.game.turn === 1 && state.humanRole !== 'black') ||
+        (state.game.turn === 2 && state.humanRole !== 'white')
+      );
+      const humanTurn = playing && state.humanRole && (
+        (state.game.turn === 1 && state.humanRole === 'black') ||
+        (state.game.turn === 2 && state.humanRole === 'white')
+      );
+      const lastMove = state.game?.history?.length ? state.game.history[state.game.history.length - 1] : null;
+      const winCells = (state.game && state.game.status === 'finished' && state.game.winner)
+        ? findWinLine(board, state.game.winner) : null;
+
+      // 新落子识别：与上一帧棋盘比对
+      const boardKey = JSON.stringify(board);
+      let prevBoard = null;
+      if (state._boardKey && state._boardKey !== boardKey) {
+        try { prevBoard = JSON.parse(state._boardKey); } catch (_) {}
+      }
+      state._boardKey = boardKey;
+
+      const turnClass = humanTurn ? (state.game.turn === 2 ? 'turn-2' : 'turn-1') : 'no-ghost';
+      const aiTurnClass = isAiTurn ? ' ai-turn' : '';
+
+      let html = `<div class="board-grid ${turnClass}${aiTurnClass}">`;
+      for (let r = 0; r < 15; r++) {
+        for (let c = 0; c < 15; c++) {
+          const cell = board[r][c];
+          const stone = cell === 1 ? 'black' : cell === 2 ? 'white' : '';
+          const isLast = lastMove && lastMove.row === r && lastMove.col === c;
+          const isWin = winCells && winCells.some(([wr, wc]) => wr === r && wc === c);
+          const isNew = prevBoard && prevBoard[r] && prevBoard[r][c] === 0 && cell !== 0;
+          const star = isStarCell(r, c) ? ' star' : '';
+          const stoneHTML = stone
+            ? `<div class="stone stone--${stone}${isLast ? ' stone--last' : ''}${isWin ? ' stone--win' : ''}${isNew ? ' stone--new' : ''}"></div>`
+            : '';
+          html += `<div class="board-cell${star}${stone ? ' has-stone' : ''}" onclick="makeMove(${r},${c})">${stoneHTML}</div>`;
+        }
+      }
+      html += '</div>';
+      return html;
+    }
+
+    /* ================= 首页渲染 ================= */
+    function renderHome() {
+      const blackIsHuman = state.black === 'human';
+      const whiteIsHuman = state.white === 'human';
+      // 人机模式：一方已选"玩家自己"，另一方就禁用该选项（保证恰好一个人类）
+      const blackHumanDisabled = state.mode === 'watch' || whiteIsHuman;
+      const whiteHumanDisabled = state.mode === 'watch' || blackIsHuman;
+      const roomList = state.rooms.length === 0
+        ? `<div class="empty"><span class="empty-emoji">🀄</span>暂无对局，创建一局开始对弈吧</div>`
+        : state.rooms.map(r => {
+            const statusBadge = r.status === 'waiting'
+              ? '<span class="badge badge-waiting">等待开始</span>'
+              : '<span class="badge badge-playing">对局中</span>';
+            const modeBadge = `<span class="badge badge-mode">${r.mode === 'pve' ? '人机对弈' : 'AI 观战'}</span>`;
+            return `
+              <div class="room-card">
+                <div class="room-info">
+                  <div class="room-title">
+                    <span>房间 #${r.id}</span>${statusBadge}${modeBadge}
+                  </div>
+                  <div class="room-meta">
+                    <span>黑方：${getSeatNameFromRoom(r, 'black')}</span>
+                    <span>白方：${getSeatNameFromRoom(r, 'white')}</span>
+                    ${r.game_id ? `<span>对局 #${r.game_id}</span>` : ''}
+                  </div>
+                </div>
+                <div class="room-actions">
+                  ${['waiting', 'finished', 'draw'].includes(r.status)
+                    ? `<button class="btn btn-primary btn-sm" onclick="startRoom(${r.id})">${r.status === 'waiting' ? '开始对局' : '再来一局'}</button>`
+                    : `<button class="btn btn-primary btn-sm" onclick="enterRoom(${r.id}, ${r.game_id ?? null})">进入观战</button>`}
+                  <button class="btn btn-ghost btn-sm" onclick="deleteRoom(${r.id})">删除</button>
+                </div>
+              </div>`;
+          }).join('');
+
+      return `
+        <div class="home-wrap">
+          <div class="hero">
+            <h1 class="hero-title">弈境 · AI 五子棋</h1>
+            <p class="hero-sub">深邃棋盘之上 · 与 AI 共弈一场五子之局</p>
+            <div class="hero-chips">
+              <span class="chip chip-black"></span>
+              <span class="chip chip-white"></span>
+            </div>
+          </div>
+
+          <div class="card create-card">
+            <div class="card-head">
+              <h2>创建对局</h2>
+              <span class="hint">先到<a href="#config" style="color:var(--amber);text-decoration:none;font-weight:700">配置管理</a>添加 AI 玩家</span>
+            </div>
+            <div class="create-body">
+              <div class="seg" role="tablist" aria-label="对局模式">
+                <button class="seg-item ${state.mode === 'pve' ? 'active' : ''}" role="tab" aria-selected="${state.mode === 'pve'}" onclick="state.mode='pve';switchMode()">⚔️ 人机对弈</button>
+                <button class="seg-item ${state.mode === 'watch' ? 'active' : ''}" role="tab" aria-selected="${state.mode === 'watch'}" onclick="state.mode='watch';switchMode()">👀 AI 观战</button>
+              </div>
+              <div class="seat-grid">
+                <div class="seat">
+                  <div class="seat-label"><span class="chip chip-black"></span>黑方</div>
+                  <select onchange="state.black=this.value;render()" aria-label="黑方玩家">
+                    <option value="">选择玩家</option>
+                    <option value="human" ${blackIsHuman ? 'selected' : ''} ${blackHumanDisabled ? 'disabled' : ''}>玩家自己</option>
+                    ${state.players.map(p => `<option value="${p.id}" ${Number(state.black) === p.id ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}
+                  </select>
+                </div>
+                <div class="seat">
+                  <div class="seat-label"><span class="chip chip-white"></span>白方</div>
+                  <select onchange="state.white=this.value;render()" aria-label="白方玩家">
+                    <option value="">选择玩家</option>
+                    <option value="human" ${whiteIsHuman ? 'selected' : ''} ${whiteHumanDisabled ? 'disabled' : ''}>玩家自己</option>
+                    ${state.players.map(p => `<option value="${p.id}" ${Number(state.white) === p.id ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}
+                  </select>
+                </div>
+              </div>
+              <div class="create-actions">
+                <button class="btn btn-primary" onclick="createRoom()">创建对局</button>
+              </div>
+              <div class="create-hint">
+                ${state.mode === 'pve' ? '人机模式：选择一位「玩家自己」+ 一位 AI 玩家，点击棋盘落子' : '观战模式：双方均为 AI，你来当裁判欣赏对局'}
+              </div>
+            </div>
+          </div>
+
+          <div class="rooms-section">
+            <h2>对局列表</h2>
+            <div class="room-list">${roomList}</div>
+          </div>
+        </div>`;
+    }
+
+    // 从房间座位解析某一方名称（首页房间卡用）
+    function getSeatNameFromRoom(room, role) {
+      if (!room) return '—';
+      const seats = Array.isArray(room.seats) ? room.seats
+        : (() => { try { return JSON.parse(room.seats || '[]'); } catch { return []; } })();
+      const seat = seats.find(s => s.role === role);
+      if (seat && (seat.player_id === null || seat.player_id === 0 || seat.player_id === 'human')) return '玩家';
+      if (seat && seat.player_id) {
+        const p = state.players.find(x => x.id === Number(seat.player_id));
+        if (p && p.name) return escapeHtml(p.name);
+      }
+      return 'AI';
+    }
+
+    // 获取某一方的展示名称：优先用房间座位配置的 AI 玩家名（state.players），
+    // 人类座位显示 "Player"，查不到时兜底 "AI"。
+    function getSeatName(role) {
+      if (state.humanRole === role) return 'Player';
+      const raw = state.currentRoom?.seats;
+      const seats = Array.isArray(raw)
+        ? raw
+        : (() => { try { return JSON.parse(raw || '[]'); } catch { return []; } })();
+      const seat = seats.find(s => s.role === role);
+      if (seat && seat.player_id) {
+        const p = state.players.find(x => x.id === Number(seat.player_id));
+        if (p && p.name) return escapeHtml(p.name);
+      }
+      return 'AI';
+    }
+
+    /* ================= 对局页渲染 ================= */
+    function renderGame() {
+      const winnerText = state.game?.winner === 1 ? '黑方获胜' : state.game?.winner === 2 ? '白方获胜' : state.game?.status === 'draw' ? '平局' : '';
+      const winnerIcon = state.game?.winner === 1 ? '⚫' : state.game?.winner === 2 ? '⚪' : state.game?.status === 'draw' ? '🤝' : '';
+      const blackName = getSeatName('black');
+      const whiteName = getSeatName('white');
+      const playing = state.game?.status === 'playing';
+      const finished = state.game?.status === 'finished';
+      const draw = state.game?.status === 'draw';
+      const isAiTurn = playing && state.humanRole && (
+        (state.game.turn === 1 && state.humanRole !== 'black') ||
+        (state.game.turn === 2 && state.humanRole !== 'white')
+      );
+      const humanTurn = playing && state.humanRole && (
+        (state.game.turn === 1 && state.humanRole === 'black') ||
+        (state.game.turn === 2 && state.humanRole === 'white')
+      );
+      const aiThinking = playing && isAiTurn && state._aiPending;
+      const stoneCount = (state.game?.board || []).reduce((s, r) => s + r.filter(c => c !== 0).length, 0);
+
+      // 回合徽标文案
+      let badgeText = '';
+      let badgeDot = false;
+      if (finished) { badgeText = '对局结束'; badgeDot = false; }
+      else if (draw) { badgeText = '平局'; badgeDot = false; }
+      else if (humanTurn) { badgeText = '你的回合 · 请落子'; badgeDot = true; }
+      else if (isAiTurn && aiThinking) { badgeText = 'AI 思考中…'; badgeDot = true; }
+      else if (isAiTurn) { badgeText = state.mode === 'watch' ? 'AI 对弈中' : 'AI 计算中…'; badgeDot = true; }
+      else if (state.mode === 'watch') { badgeText = 'AI 对弈中'; badgeDot = true; }
+      else { badgeText = '对局进行中'; badgeDot = true; }
+
+      // 玩家卡激活态：当前回合方高亮；AI 思考时显示 spinner
+      const blackActive = playing && state.game.turn === 1;
+      const whiteActive = playing && state.game.turn === 2;
+      const blackThinking = blackActive && aiThinking;
+      const whiteThinking = whiteActive && aiThinking;
+
+      const statusText = finished ? '黑方胜' : draw ? '平局' : '进行中';
+      const turnText = finished ? '已结束' : draw ? '平局' : (state.game.turn === 1 ? '黑方' : '白方');
+      const modeText = state.mode === 'pve' ? '人机对弈' : 'AI 观战';
+
+      let resultOverlay = '';
+      if (finished || draw) {
+        resultOverlay = `
+          <div class="result-overlay">
+            <div class="result-card">
+              <div class="result-icon">${winnerIcon}</div>
+              <div class="result-title">${winnerText || '对局结束'}</div>
+              <div class="result-sub">本局共 ${stoneCount} 手 · ${modeText}</div>
+              <div class="result-actions">
+                <button class="btn btn-primary" onclick="restartGame()">再来一局</button>
+                <button class="btn btn-ghost" onclick="goHome()">返回首页</button>
+              </div>
+            </div>
+          </div>`;
+      }
+
+      const logsHTML = (state.logs || []).length === 0
+        ? '<div class="log-empty">暂无日志 — AI 落子后将在这里展示思考过程</div>'
+        : (state.logs || []).map(log => `<div class="log-entry">${escapeHtml(log)}</div>`).join('');
+
+      // 渲染后滚动日志到底部
+      setTimeout(() => {
+        const lp = document.getElementById('log-list');
+        if (lp) lp.scrollTop = lp.scrollHeight;
+      }, 0);
+
+      return `
+        <div class="game-layout">
+          <section class="game-main">
+            <div class="playerbar">
+              <div class="player-card ${blackActive ? 'active' : ''}">
+                <span class="chip chip-black"></span>
+                <div style="min-width:0">
+                  <div class="p-name">${blackName === 'Player' ? '玩家' : blackName}</div>
+                  <div class="p-role">黑方 · 先手</div>
+                </div>
+                <span class="p-status">${blackThinking ? '<span class="spinner"></span>' : (blackActive && !humanTurn ? '<span class="tb-dot" style="width:8px;height:8px;border-radius:50%;background:var(--amber);box-shadow:0 0 10px 1px rgba(232,180,90,.75)"></span>' : '')}</span>
+              </div>
+              <div class="turn-badge">
+                ${badgeDot ? '<span class="tb-dot"></span>' : ''}
+                <span>${badgeText}</span>
+              </div>
+              <div class="player-card ${whiteActive ? 'active' : ''}">
+                <span class="chip chip-white"></span>
+                <div style="min-width:0">
+                  <div class="p-name">${whiteName === 'Player' ? '玩家' : whiteName}</div>
+                  <div class="p-role">白方 · 后手</div>
+                </div>
+                <span class="p-status">${whiteThinking ? '<span class="spinner"></span>' : (whiteActive && !humanTurn ? '<span class="tb-dot" style="width:8px;height:8px;border-radius:50%;background:var(--amber);box-shadow:0 0 10px 1px rgba(232,180,90,.75)"></span>' : '')}</span>
+              </div>
+            </div>
+
+            <div class="board-wrap">
+              <div class="board-frame">
+                ${renderBoard()}
+              </div>
+              ${resultOverlay}
+            </div>
+
+            <div class="game-controls">
+              <button class="btn btn-primary" id="btn-restart" onclick="restartGame()">重新开始</button>
+              <button class="btn btn-ghost" onclick="goHome()">返回首页</button>
+            </div>
+          </section>
+
+          <aside class="side-panel">
+            <div class="panel-card">
+              <div class="panel-head">📊 对局信息</div>
+              <div class="stat-grid">
+                <div class="stat-item"><div class="stat-label">模式</div><div class="stat-value">${modeText}</div></div>
+                <div class="stat-item"><div class="stat-label">状态</div><div class="stat-value">${statusText}</div></div>
+                <div class="stat-item"><div class="stat-label">当前回合</div>
+                  <div class="stat-value">
+                    ${playing ? `<span class="dot ${state.game.turn === 1 ? 'dot-black' : 'dot-white'}"></span>${turnText}` : turnText}
+                  </div>
+                </div>
+                <div class="stat-item"><div class="stat-label">已落子</div><div class="stat-value">${stoneCount} 手</div></div>
+              </div>
+            </div>
+            <div class="panel-card">
+              <div class="panel-head">🧠 AI 思考日志</div>
+              <div class="log-list" id="log-list">${logsHTML}</div>
+            </div>
+          </aside>
+        </div>`;
+    }
+
+    /* ================= 配置页渲染 ================= */
+    function renderConfig() {
+      const selectedConfig = state.configs.find(c => c.id === state.selectedConfigId);
+      const models = selectedConfig?.models || [];
+      return `
+        <div class="config-wrap">
+          <div class="card config-sec">
+            <h3><span class="num">1</span>模型配置</h3>
+            <div class="form-grid">
+              <div class="field"><label>配置名称</label><input class="input" id="cfg-name" placeholder="例如：DeepSeek" /></div>
+              <div class="field"><label>Base URL</label><input class="input" id="cfg-url" placeholder="https://api.example.com/v1" /></div>
+              <div class="field full"><label>API Key</label><input class="input" id="cfg-key" type="password" placeholder="sk-..." /></div>
+            </div>
+            <div class="create-actions">
+              <button class="btn btn-primary" onclick="submitConfig()">添加配置</button>
+            </div>
+            <div class="cfg-list">
+              ${state.configs.map(c => `
+                <div class="cfg-card ${state.selectedConfigId === c.id ? 'selected' : ''}">
+                  <div class="row1">
+                    <div>
+                      <div class="cname">${escapeHtml(c.name)}</div>
+                      <div class="curl">${escapeHtml(c.base_url)}</div>
+                      ${c.models?.length ? `<div class="cmodels"><b>✓</b> 已拉取 ${c.models.length} 个模型</div>` : '<div class="cmodels">尚未拉取模型</div>'}
+                    </div>
+                    <div class="cfg-actions">
+                      <button class="btn btn-ghost btn-sm" onclick="testConfig(${c.id})">测试</button>
+                      <button class="btn btn-ghost btn-sm" onclick="fetchModels(${c.id})">拉取模型</button>
+                      <button class="btn btn-danger btn-sm" onclick="deleteConfig(${c.id})">删除</button>
+                    </div>
+                  </div>
+                  ${c.models?.length ? `<div class="cmodels" style="margin-top:10px;padding:9px 11px;background:#0e1526;border-radius:8px">可用模型：<br><span style="color:var(--text-2);font-family:var(--font-mono)">${c.models.map(m => escapeHtml(m)).join(', ')}</span></div>` : ''}
+                </div>
+              `).join('') || '<div class="empty">暂无配置，请添加第一个模型配置</div>'}
+            </div>
+          </div>
+
+          <div class="card config-sec">
+            <h3><span class="num">2</span>AI 玩家</h3>
+            <div class="form-grid">
+              <div class="field"><label>玩家名称</label><input class="input" id="player-name" placeholder="例如：Alpha 弈" /></div>
+              ${models.length > 0
+                ? `<div class="field"><label>模型</label><select class="select" id="player-model">${models.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}</select></div>`
+                : `<div class="field"><label>模型 ID</label><input class="input" id="player-model" placeholder="请先选择配置并拉取模型" /></div>`}
+              <div class="field">
+                <label>思考等级</label>
+                <select class="select" id="player-effort">
+                  <option value="">默认（不设置）</option>
+                  <option value="low">低</option>
+                  <option value="medium">中</option>
+                  <option value="high">高</option>
+                </select>
+              </div>
+              <div class="field" style="display:flex;align-items:flex-end">
+                <button class="btn btn-ghost btn-sm" id="btn-test-player" onclick="testPlayerLLM('player-model','player-effort',null,this)" style="width:100%">测试当前配置</button>
+              </div>
+            </div>
+            <div class="create-actions">
+              <button class="btn btn-primary" onclick="submitPlayer()">添加玩家</button>
+            </div>
+            <div class="player-list">
+              ${state.players.map(p => {
+                const cfg = state.configs.find(c => c.id === p.model_config_id);
+                const isEditing = state.editingPlayerId === p.id;
+                if (isEditing) {
+                  const cfgOptions = state.configs.map(c =>
+                    `<option value="${c.id}" ${c.id === p.model_config_id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`
+                  ).join('');
+                  return `
+                  <div class="cfg-card" style="border-color:rgba(232,180,90,.55);box-shadow:0 0 0 3px var(--amber-dim)">
+                    <div class="cname" style="color:var(--amber)">编辑玩家 #${p.id}</div>
+                    <div class="edit-box">
+                      <div class="form-grid">
+                        <div class="field"><label>玩家名称</label><input class="input" id="edit-player-name-${p.id}" value="${escapeHtml(p.name)}" /></div>
+                        <div class="field"><label>模型配置</label>
+                          <select class="select" id="edit-player-cfg-${p.id}">${cfgOptions}</select>
+                        </div>
+                        <div class="field"><label>模型 ID</label><input class="input" id="edit-player-model-${p.id}" value="${escapeHtml(p.model_id)}" /></div>
+                        <div class="field">
+                          <label>思考等级</label>
+                          <select class="select" id="edit-player-effort-${p.id}">
+                            <option value="" ${(p.reasoning_effort || '') === '' ? 'selected' : ''}>默认（不设置）</option>
+                            <option value="low" ${p.reasoning_effort === 'low' ? 'selected' : ''}>低</option>
+                            <option value="medium" ${p.reasoning_effort === 'medium' ? 'selected' : ''}>中</option>
+                            <option value="high" ${p.reasoning_effort === 'high' ? 'selected' : ''}>高</option>
+                          </select>
+                        </div>
+                        <div class="field" style="display:flex;align-items:flex-end">
+                          <button class="btn btn-ghost btn-sm" onclick="testPlayerLLM('edit-player-model-${p.id}','edit-player-effort-${p.id}','edit-player-cfg-${p.id}',this)" style="width:100%">测试当前配置</button>
+                        </div>
+                      </div>
+                      <div class="create-actions">
+                        <button class="btn btn-primary btn-sm" onclick="savePlayerEdit(${p.id})">保存</button>
+                        <button class="btn btn-ghost btn-sm" onclick="state.editingPlayerId=null;render()">取消</button>
+                      </div>
+                    </div>
+                  </div>`;
+                }
+                return `
+                <div class="player-card-row">
+                  <div class="prow">
+                    <div>
+                      <div class="pname">${escapeHtml(p.name)}</div>
+                      <div class="pmeta">${escapeHtml(p.model_id)} · ${escapeHtml(cfg?.name || '-')} · 思考 ${effortLabel(p.reasoning_effort)}</div>
+                    </div>
+                    <div class="row-actions">
+                      <button class="btn btn-ghost btn-sm" onclick="state.editingPlayerId=${p.id};render()">编辑</button>
+                      <button class="btn btn-danger btn-sm" onclick="deletePlayer(${p.id})">删除</button>
+                    </div>
+                  </div>
+                </div>`;
+              }).join('') || '<div class="empty">暂无 AI 玩家，添加后可创建对局</div>'}
+            </div>
+            <div class="config-hint">
+              <span>配置完成后，返回首页创建对局。</span>
+              <a href="/" class="btn btn-primary btn-sm">前往创建对局 →</a>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    /* ================= 配置提交 ================= */
+    async function submitConfig() {
+      const name = document.getElementById('cfg-name').value;
+      const baseUrl = document.getElementById('cfg-url').value;
+      const apiKey = document.getElementById('cfg-key').value;
+      if (!name || !baseUrl || !apiKey) return toast('请填写完整配置信息', 'error');
+      await api('/configs/', { method: 'POST', body: JSON.stringify({ name, base_url: baseUrl, api_key: apiKey, models: [] }) });
+      toast('模型配置已添加', 'success');
+      await loadConfigs();
+    }
+
+    async function submitPlayer() {
+      const nameEl = document.getElementById('player-name');
+      const modelEl = document.getElementById('player-model');
+      const name = nameEl?.value?.trim();
+      const modelId = modelEl?.value?.trim();
+      const reasoningEffort = document.getElementById('player-effort')?.value || '';
+      const modelConfigId = state.selectedConfigId || (state.configs.length > 0 ? state.configs[0].id : null);
+      if (!name) return toast('请输入玩家名称', 'error');
+      if (!modelConfigId) return toast('请先添加模型配置', 'error');
+      if (!modelId) return toast('请选择或输入模型 ID', 'error');
+      await api('/players/', { method: 'POST', body: JSON.stringify({ name, model_config_id: modelConfigId, model_id: modelId, reasoning_effort: reasoningEffort }) });
+      toast('AI 玩家已添加', 'success');
+      await loadConfigs();
+    }
+
+    async function savePlayerEdit(id) {
+      const name = document.getElementById(`edit-player-name-${id}`)?.value?.trim();
+      const cfgEl = document.getElementById(`edit-player-cfg-${id}`);
+      const modelId = document.getElementById(`edit-player-model-${id}`)?.value?.trim();
+      const reasoningEffort = document.getElementById(`edit-player-effort-${id}`)?.value || '';
+      if (!name) return toast('请输入玩家名称', 'error');
+      const modelConfigId = cfgEl ? Number(cfgEl.value) : null;
+      if (!modelConfigId) return toast('请选择模型配置', 'error');
+      if (!modelId) return toast('请输入模型 ID', 'error');
+      try {
+        await api(`/players/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ name, model_config_id: modelConfigId, model_id: modelId, reasoning_effort: reasoningEffort })
+        });
+        state.editingPlayerId = null;
+        await loadConfigs();
+        toast('玩家已更新', 'success');
+      } catch (e) {
+        toast('保存失败: ' + e.message, 'error');
+      }
+    }
+
+    // 测试"模型配置 + 模型 + 思考等级"能否连通（思考等级下拉旁的测试按钮）
+    async function testPlayerLLM(modelIdElId, effortElId, cfgIdOrEl, btn) {
+      const modelId = document.getElementById(modelIdElId)?.value?.trim();
+      const effort = document.getElementById(effortElId)?.value || '';
+      let cfgId = cfgIdOrEl;
+      if (typeof cfgIdOrEl === 'string') cfgId = document.getElementById(cfgIdOrEl)?.value;
+      if (!cfgId) cfgId = state.selectedConfigId || (state.configs.length > 0 ? state.configs[0].id : null);
+      if (!cfgId) return toast('请先添加模型配置', 'error');
+      if (!modelId) return toast('请选择或输入模型 ID', 'error');
+      if (btn) { btn.disabled = true; btn.textContent = '测试中…'; }
+      try {
+        const res = await api('/players/test_llm', { method: 'POST', body: JSON.stringify({ model_config_id: Number(cfgId), model_id: modelId, reasoning_effort: effort }) });
+        if (res.status === 'ok') {
+          toast('✅ ' + res.detail, 'success');
+        } else {
+          toast(res.detail || '测试失败', 'error');
+        }
+      } catch (e) {
+        toast('测试失败: ' + e.message, 'error');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '测试当前配置'; }
+      }
+    }
+
+    /* ================= 重新开始 / 返回 ================= */
+    async function restartGame() {
+      const ok = await showModal({
+        title: '重新开始',
+        message: '确认开启一局新的对弈？当前对局记录将保留在历史中。',
+        confirmText: '开始新对局',
+      });
+      if (!ok || !state.game) return;
+      const btn = document.getElementById('btn-restart');
+      if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> 开局中…'; }
+      try {
+        const res = await api(`/rooms/${state.game.room_id}/start`, { method: 'POST' });
+        location.href = `#game/${res.game_id}`;
+      } catch (e) {
+        toast('重新开始失败: ' + e.message, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = '重新开始'; }
+      }
+    }
+
+    function goHome() {
+      location.href = '/';
+    }
+
+    /* ================= 路由渲染 ================= */
+    async function render() {
+      const hash = location.hash;
+      const app = document.getElementById('app');
+
+      // 离开游戏页面时清理 SSE 连接
+      if (!hash.startsWith('#game')) {
+        if (state._es) {
+          state._es.close();
+          state._es = null;
+        }
+        // 如果当前不在游戏页面且不在配置页面，清理 game 状态
+        if (!hash.startsWith('#config')) {
+          state.game = null;
+          state.logs = [];
+          state.currentRoom = null;
+          state._boardKey = '';
+        }
+      }
+
+      const topbar = (title, right) => `
+        <header class="topbar">
+          <a class="brand" href="/" aria-label="返回首页">
+            <span class="brand-logo"></span>
+            <span>
+              <span class="brand-name">弈境<em>·</em>五子棋</span>
+              <div class="brand-sub">AI Gomoku</div>
+            </span>
+          </a>
+          <div class="topbar-right">${right || ''}</div>
+        </header>`;
+
+      if (hash.startsWith('#config')) {
+        app.innerHTML = topbar('配置', '<a class="btn btn-ghost btn-sm" href="/">返回首页</a>') + renderConfig();
+      } else if (hash.startsWith('#game')) {
+        const parts = hash.split('/');
+        const id = Number(parts[1]);
+        if (id && !isNaN(id)) {
+          if (!state.game || state.game.id !== id) {
+            if (state._es) {
+              state._es.close();
+              state._es = null;
+            }
+            state.game = null;
+            state.logs = [];
+            state._boardKey = '';
+            await loadGame(id);
+          }
+          app.innerHTML = topbar('对局', `<span class="game-chip">对局 #${id}</span><a class="btn btn-ghost btn-sm" href="/">返回</a>`) + renderGame();
+        } else {
+          app.innerHTML = topbar('无效对局', '') + '<div class="empty" style="padding:60px 20px">无效的对局链接，请从首页进入。</div>';
+        }
+      } else {
+        // 首页：先刷新房间列表（反映 waiting/playing 最新状态，支持退出后按钮切换）
+        try {
+          state.rooms = await api('/rooms/');
+        } catch (e) {
+          /* 拉取失败保留旧数据 */
+        }
+        app.innerHTML = topbar('首页', '<a class="btn btn-ghost btn-sm" href="#config">⚙️ 配置管理</a>') + renderHome();
+      }
+    }
+
+    location.hash = '';
+    loadConfigs();
+    loadRooms();
+    window.addEventListener('hashchange', render);
+  </script>
+</body>
+</html>
