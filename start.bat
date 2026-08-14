@@ -76,25 +76,35 @@ echo.
 echo [START] uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
 echo [URL]   http://localhost:%FINAL_PORT%/
 echo [DOCS]  http://localhost:%FINAL_PORT%/docs
-echo [STOP]  Press Ctrl+C, or run stop.bat
+echo [STOP]  Close the "AI Gomoku Backend" window, or run stop.bat
 echo.
 
-rem --- launch ---
+rem --- launch server in a dedicated window (logs visible, independent of this script) ---
 if "!PY!"=="py" (
-    py -3.10 -m uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
+    start "AI Gomoku Backend" py -m uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
 ) else (
-    "!PY!" -m uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
+    start "AI Gomoku Backend" "!PY!" -m uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
 )
-set "UVICORN_EXITCODE=%errorlevel%"
 
-popd
-echo.
-if %UVICORN_EXITCODE% neq 0 (
-    echo [WARN] uvicorn exited with code %UVICORN_EXITCODE%.
-    echo        Common cause: port %FINAL_PORT% just got occupied. Run stop.bat then retry.
-) else (
-    echo [DONE] Service exited cleanly.
+rem --- wait for server readiness (poll port, up to ~30s) ---
+set "READY=0"
+for /L %%T in (1,1,30) do (
+    netstat -ano | findstr " LISTENING " | findstr ":%FINAL_PORT% " >nul 2>&1
+    if not errorlevel 1 (
+        set "READY=1"
+        rem --- additional delay to ensure server is fully ready ---
+        timeout /t 2 >nul 2>&1
+        goto :OPEN_BROWSER
+    )
+    timeout /t 1 >nul 2>&1
 )
-echo Press any key to close . . .
-pause >nul
+
+:OPEN_BROWSER
+if "!READY!"=="1" (
+    echo [INFO] Server is ready. Opening page in browser...
+    start "" "http://localhost:%FINAL_PORT%/"
+) else (
+    echo [WARN] Server not ready within 30s. Open manually: http://localhost:%FINAL_PORT%/
+)
+popd
 endlocal
