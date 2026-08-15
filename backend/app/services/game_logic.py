@@ -13,7 +13,7 @@ def is_valid_move(board: List[List[int]], row: int, col: int) -> bool:
 
 
 def place_stone(board: List[List[int]], row: int, col: int, player: int) -> List[List[int]]:
-    new_board = [row[:] for row in board]
+    new_board = [r[:] for r in board]
     new_board[row][col] = player
     return new_board
 

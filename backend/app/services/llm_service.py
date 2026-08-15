@@ -1,7 +1,9 @@
 import json
 import random
+import time
 import httpx
 from openai import OpenAI
+from openai import BadRequestError, UnprocessableEntityError, NotFoundError, APITimeoutError, APIConnectionError
 from . import game_logic
 from .game_logic import DIRECTIONS, N, count_line, place_stone, is_valid_move, is_forbidden_move
 
@@ -336,6 +338,11 @@ MAX_TOKENS_RETRY = 8192
 # 分类超时：建连 5s / 思考(读响应) 30s / 发送请求体 15s / 连接池 5s
 TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=5.0)
 
+# AI 落子单次 LLM 调用的总时长上限（含全部降级/重试）。
+# 之前无上限：降级链 4 组合 × 30s + 2 次预算重试，最坏 240s，
+# 期间 turn 停在 AI 回合、前端锁定，表现为"AI 思考特别慢、轮不到我"。
+LLM_CALL_DEADLINE = 45.0
+
 
 def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=""):
     """调用 LLM 返回 (row, col, reason)。任何失败返回 (None, None, err_msg)。
@@ -359,6 +366,7 @@ def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=
         temperature=temperature,
     )
     last_err = ""
+    deadline = time.monotonic() + LLM_CALL_DEADLINE
     for attempt in range(2):  # 最多重试 1 次（截断升级预算 / 偶发格式不稳）
         max_tokens = MAX_TOKENS_RETRY if attempt == 1 else MAX_TOKENS_NORMAL
         kwargs = {**base_kwargs, "max_tokens": max_tokens}
@@ -379,19 +387,29 @@ def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=
         response = None
         last_exc = None
         for combo in combos:
+            if time.monotonic() >= deadline:
+                last_exc = TimeoutError(f"LLM 调用超总时长上限 {int(LLM_CALL_DEADLINE)}s")
+                break
             try:
                 response = client.chat.completions.create(**combo)
                 break
-            except Exception as e:
+            except (BadRequestError, UnprocessableEntityError, NotFoundError, TypeError) as e:
+                # 参数/格式不兼容（4xx）→ 快速失败，降级下一组合继续尝试
                 last_exc = e
+                continue
+            except Exception as e:
+                # 超时/连接/服务端 5xx：与参数无关，后续组合大概率同样失败，
+                # 直接放弃，避免 4 组合 × 30s 白等（AI 落子卡死、用户干等）
+                last_exc = e
+                break
         if response is None:
             return None, None, str(last_exc) if last_exc else "LLM 请求失败"
         finish = getattr(response.choices[0], "finish_reason", "")
         content = response.choices[0].message.content
         if content is None or not content.strip():
             err = _empty_content_err(response, "content is None" if content is None else "空字符串")
-            # 截断型失败：用更大预算重试一次
-            if attempt == 0 and finish == "length":
+            # 截断型失败：用更大预算重试一次（若仍在总时限内）
+            if attempt == 0 and finish == "length" and time.monotonic() < deadline:
                 last_err = err
                 continue
             return None, None, err
@@ -473,6 +491,10 @@ def ai_move(board, turn, history, model_config, player_name, forbidden=False):
                 llm_note = f"（LLM 落点为禁手 ({row},{col})）"
             else:
                 # 校验 LLM 落点评分：不低于引擎候选的 60% 才采纳
+                # 60% 阈值理由：允许 LLM 在非关键局面（无连五/活四/冲四）进行风格化决策，
+                # 同时防止 LLM 选择明显劣着（如完全放弃防守、孤立落子）。
+                # 引擎评分基于棋型权重（连五=1000万、活四=100万等），60% 足以过滤掉
+                # 纯随机或明显错误的落子，同时保留 LLM 的策略多样性。
                 llm_attack, llm_defend = score_point(board, row, col, me, enemy)
                 llm_total = llm_attack + int(llm_defend * DEFEND_WEIGHT)
                 if llm_total >= e_total * 0.6:

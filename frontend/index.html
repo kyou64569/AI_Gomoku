@@ -889,17 +889,29 @@
         try { state._es.close(); } catch (_) {}
         state._es = null;
       }
+      if (state._hb) { clearInterval(state._hb); state._hb = null; }
+      let lastPushTime = Date.now();
       const es = new EventSource(`/api/games/${gameId}/stream`);
       state._es = es;
       state._es.gameId = gameId;
       console.log(`[SSE] connecting attempt=${attempt}`);
-      es.onopen = () => {
+      es.onopen = async () => {
         console.log('[SSE] open');
         attempt = 0;  // 连上后清零重试计数
+        // 重连成功后全量拉取一次最新状态：防止断连期间 AI 已落子但前端没收到
+        // game_update，导致 turn 停留在旧值、用户被"锁死"无法落子
+        try {
+          const fresh = await api(`/games/${gameId}/state`);
+          if (fresh && fresh.board) {
+            state.game = { ...state.game, ...fresh };
+            render().catch(err => console.error('[render] error', err));
+          }
+        } catch (_) { /* 拉取失败等下次推送 */ }
       };
       es.addEventListener('game_update', e => {
         try {
           const data = JSON.parse(e.data);
+          lastPushTime = Date.now();
           const prevStoneCount = (state.game?.board || []).reduce((s, r) => s + r.filter(c => c !== 0).length, 0);
           state.game = { ...state.game, ...data };
           state._aiPending = !!data.ai_pending;
@@ -922,6 +934,7 @@
           state.game.status = data.status;
           state.game.winner = data.winner;
           state._aiPending = false;
+          lastPushTime = Date.now();
           render().catch(err => console.error('[render] error', err));
         } catch (err) {
           console.error('[SSE] game_over parse error', err);
@@ -932,13 +945,33 @@
         console.error('[SSE] onerror', e, 'readyState=', es.readyState);
         // 终局状态就不重连
         if (state.game && (state.game.status === 'finished' || state.game.status === 'draw')) return;
-        if (es.readyState === EventSource.CLOSED) {
+        // 只要连接不是 OPEN 就主动重建（EventSource 可能卡在 CONNECTING 不触发重连回调）
+        if (es.readyState !== EventSource.OPEN) {
+          es.close();
           const delay = Math.min(1000 * Math.pow(1.6, attempt), 10000);
           attempt += 1;
-          console.log(`[SSE] CLOSED, reconnecting in ${Math.round(delay)}ms (attempt ${attempt})`);
+          console.log(`[SSE] reconnecting in ${Math.round(delay)}ms (attempt ${attempt})`);
           setTimeout(() => connectSSE(gameId, attempt), delay);
         }
       };
+      // 心跳兜底：SSE 静默失效（连接活着但不推送）时，4s 后主动拉 /state 同步，
+      // 避免"AI 已落子但前端卡在旧 turn"的假卡死，最多延迟几秒自愈
+      state._hb = setInterval(async () => {
+        if (!state.game || state.game.status === 'finished' || state.game.status === 'draw') return;
+        if (Date.now() - lastPushTime > 4000) {
+          console.log('[SSE] heartbeat: no push for 4s, syncing state...');
+          // 存储 fetch 前的 lastPushTime，防止 fetch 期间 SSE 推送新数据导致覆盖
+          const beforeFetch = lastPushTime;
+          try {
+            const fresh = await api(`/games/${gameId}/state`);
+            // 只有在 fetch 期间没有新 SSE 推送时才应用心跳结果，避免用旧状态覆盖新状态
+            if (fresh && fresh.board && lastPushTime === beforeFetch) {
+              state.game = { ...state.game, ...fresh };
+              render().catch(err => console.error('[render] error', err));
+            }
+          } catch (_) {}
+        }
+      }, 3000);
     }
 
     /* ================= 落子 ================= */
@@ -954,7 +987,10 @@
       try {
         const res = await api(`/games/${state.game.id}/move`, { method: 'POST', body: JSON.stringify({ row, col }) });
         // 乐观更新：立即在棋盘上放置棋子并切换回合，不用等 SSE
-        const myStone = state.game.turn; // 1 或 2
+        // 棋子颜色必须用用户固定身份（humanRole），不能用 state.game.turn：
+        // POST 等待期间 SSE 可能已把 turn 切到对方回合，读 turn 会把黑子渲染成白棋、
+        // 且 turn 被切回自己回合导致"无法落子"（后端实际是 AI 回合）的假卡顿。
+        const myStone = state.humanRole === 'black' ? 1 : 2;
         const newBoard = state.game.board.map((r, ri) => r.map((c, ci) => (ri === row && ci === col ? myStone : c)));
         const stoneCount = newBoard.reduce((s, r) => s + r.filter(c => c !== 0).length, 0);
         state.game = { ...state.game, board: newBoard, turn: 3 - myStone };

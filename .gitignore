@@ -63,3 +63,9 @@ backend/.port
 
 # ========== 工作区内部数据（勿上传） ==========
 .workbuddy/
+
+# ========== 内部文档（勿上传：需求 / 审查） ==========
+# 注：PRD.md 同时匹配根目录与 docs/ 下的需求文档
+PRD.md
+docs/CODE_AUDIT.md
+docs/GOMOKU_CODE_REVIEW.md

@@ -129,7 +129,6 @@ def handle_move(db: Session, game_id: int, player: int, row: int, col: int,
     game.history = json.dumps(history)
     game.winner = winner
     game.logs = json.dumps(logs[-50:])
-    game.status = game.status  # Ensure status is set
     db.commit()
     db.refresh(game)
     return game
