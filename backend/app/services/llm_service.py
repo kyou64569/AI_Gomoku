@@ -1,6 +1,7 @@
 import json
 import random
 import time
+import threading
 import httpx
 from openai import OpenAI
 from openai import BadRequestError, UnprocessableEntityError, NotFoundError, APITimeoutError, APIConnectionError
@@ -343,6 +344,33 @@ TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=5.0)
 # 期间 turn 停在 AI 回合、前端锁定，表现为"AI 思考特别慢、轮不到我"。
 LLM_CALL_DEADLINE = 45.0
 
+# ============ 参数组合缓存（Fix A：消除重复 LLM 调用） ============
+# 同一 (base_url, model_id, reasoning_effort) 的模型，首战后记住哪个参数组合成功、
+# 把返回过 4xx 的组合标记失效。后续落子只发那 1 个成功组合 → LLM 真实请求数从
+# 1~8× 降到精确 1×，避免商汤等按次计费/限流（RPM、5h 500 次）被隐性放大。
+# 根因：之前每次落子因 response_format 兼容性问题会逐级降级试遍 2~4 个组合，每个被拒
+# 组合都算 1 次真实 HTTP 请求 → 观战双 AI 自动连下时轻松突破 RPM 触发 429。
+_combo_cache = {}  # key: (base_url, model_id, reasoning_effort) -> {"good": sig|None, "bad": set(sig), "last_used": timestamp}
+_combo_cache_lock = threading.Lock()
+_COMBO_CACHE_MAX_SIZE = 100  # 最多缓存 100 个不同模型的组合
+_COMBO_CACHE_TTL = 3600.0  # 缓存 TTL：1 小时后失效（应对 API 兼容性变化）
+
+
+def _combo_signature(combo: dict) -> tuple:
+    """组合的结构化指纹（排除 messages / max_tokens：每次落子内容与预算不同，
+    但参数兼容性的差异轴只有 model / response_format / reasoning_effort / temperature / stream 等）。"""
+    parts = []
+    for k in sorted(combo.keys()):
+        if k in ("messages", "max_tokens"):
+            continue
+        v = combo[k]
+        try:
+            s = json.dumps(v, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            s = repr(v)
+        parts.append(f"{k}={s}")
+    return tuple(parts)
+
 
 def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=""):
     """调用 LLM 返回 (row, col, reason)。任何失败返回 (None, None, err_msg)。
@@ -367,6 +395,7 @@ def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=
     )
     last_err = ""
     deadline = time.monotonic() + LLM_CALL_DEADLINE
+    cache_key = (base_url, model_id, reasoning_effort)
     for attempt in range(2):  # 最多重试 1 次（截断升级预算 / 偶发格式不稳）
         max_tokens = MAX_TOKENS_RETRY if attempt == 1 else MAX_TOKENS_NORMAL
         kwargs = {**base_kwargs, "max_tokens": max_tokens}
@@ -384,22 +413,65 @@ def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=
                 {**kwargs, "response_format": {"type": "json_object"}},
                 kwargs,
             ]
+        # Fix A：应用参数组合缓存——优先用已知成功的组合（单请求），跳过已知 4xx 的组合。
+        # 首战会把每个被拒组合标记失效、把成功组合记为 good，后续落子直接命中 good → 不再逐组合试错。
+        with _combo_cache_lock:
+            # 清理过期缓存（TTL）
+            now = time.monotonic()
+            expired_keys = [k for k, v in _combo_cache.items() if now - v.get("last_used", 0) > _COMBO_CACHE_TTL]
+            for k in expired_keys:
+                del _combo_cache[k]
+
+            # 获取或初始化缓存条目
+            cached = _combo_cache.get(cache_key)
+            if cached is None:
+                cached = {"good": None, "bad": set(), "last_used": now}
+                _combo_cache[cache_key] = cached
+                # LRU 淘汰：超过最大大小时删除最久未使用的条目
+                if len(_combo_cache) > _COMBO_CACHE_MAX_SIZE:
+                    oldest_key = min(_combo_cache.keys(), key=lambda k: _combo_cache[k].get("last_used", 0))
+                    if oldest_key != cache_key:
+                        del _combo_cache[oldest_key]
+            else:
+                cached["last_used"] = now
+
+            # 在锁内复制引用，避免竞态条件
+            good_sig = cached["good"]
+            bad_sigs = set(cached["bad"])  # 复制集合，避免并发修改
+
+        def _combo_rank(c):
+            sig = _combo_signature(c)
+            if good_sig is not None and sig == good_sig:
+                return 0
+            if sig in bad_sigs:
+                return 2
+            return 1
+
+        combos.sort(key=_combo_rank)
+
         response = None
         last_exc = None
         for combo in combos:
+            sig = _combo_signature(combo)
             if time.monotonic() >= deadline:
                 last_exc = TimeoutError(f"LLM 调用超总时长上限 {int(LLM_CALL_DEADLINE)}s")
                 break
             try:
                 response = client.chat.completions.create(**combo)
+                # 记录成功组合，后续落子只发这 1 个 → 不再逐组合试错（省配额）
+                with _combo_cache_lock:
+                    _combo_cache[cache_key]["good"] = sig
                 break
             except (BadRequestError, UnprocessableEntityError, NotFoundError, TypeError) as e:
-                # 参数/格式不兼容（4xx）→ 快速失败，降级下一组合继续尝试
+                # 参数/格式不兼容（4xx）→ 快速失败，降级下一组合继续尝试；
+                # 同时标记该组合失效，下次直接跳过（避免重复浪费配额）
                 last_exc = e
+                with _combo_cache_lock:
+                    _combo_cache[cache_key]["bad"].add(sig)
                 continue
             except Exception as e:
                 # 超时/连接/服务端 5xx：与参数无关，后续组合大概率同样失败，
-                # 直接放弃，避免 4 组合 × 30s 白等（AI 落子卡死、用户干等）
+                # 直接放弃，避免组合 × 超时 白等（AI 落子卡死、用户干等）
                 last_exc = e
                 break
         if response is None:

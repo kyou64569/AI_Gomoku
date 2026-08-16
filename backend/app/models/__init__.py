@@ -55,4 +55,5 @@ class Game(Base):
     logs = Column(Text, default="[]")
     scores = Column(Text, default='{"black":0,"white":0}')
     status = Column(String(20), default="playing")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     room = relationship("Room")

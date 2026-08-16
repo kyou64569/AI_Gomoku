@@ -4,7 +4,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 import logging
-from .routers import configs_router, players_router, rooms_router, game_router
+from datetime import datetime, timezone
+from .routers import configs_router, players_router, rooms_router, game_router, history_router
 from .models import Base
 from .database import engine
 
@@ -36,6 +37,16 @@ def _migrate_schema():
                 conn.execute(text("ALTER TABLE model_configs DROP COLUMN reasoning_effort"))
                 conn.commit()
                 logger.info("[migrate] model_configs.reasoning_effort 列已移除（迁移至 ai_players）")
+            # games 增加 created_at（历史页对局时间）
+            # SECURITY NOTE: Table names are hardcoded here to prevent SQL injection
+            gcols = [row[1] for row in conn.execute(text("PRAGMA table_info(games)"))]
+            if "created_at" not in gcols:
+                conn.execute(text("ALTER TABLE games ADD COLUMN created_at DATETIME"))
+                # 使用 Python 生成 UTC 时间戳，避免 SQLite 特定函数依赖
+                now_utc = datetime.now(timezone.utc).isoformat()
+                conn.execute(text("UPDATE games SET created_at = :now WHERE created_at IS NULL"), {"now": now_utc})
+                conn.commit()
+                logger.info("[migrate] games.created_at 列已添加（现有记录已更新）")
         except Exception as e:
             logger.error(f"[migrate] 列迁移失败: {e}", exc_info=True)
             # For critical migration failures, consider raising the exception
@@ -59,5 +70,6 @@ app.include_router(configs_router)
 app.include_router(players_router)
 app.include_router(rooms_router)
 app.include_router(game_router)
+app.include_router(history_router)
 
 app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")

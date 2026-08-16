@@ -14,7 +14,12 @@ router = APIRouter(prefix="/api/games", tags=["games"])
 
 # 全局锁：防止同一个 game_id 的 AI 落子被同时触发
 # 存储格式：{game_id: lock_timestamp}，timestamp 为锁获取时间（monotonic 时间）
-AI_LOCK_TTL = 60.0  # 锁 TTL：60 秒后自动释放（防止线程崩溃导致锁死）
+# 锁 TTL：必须大于「单次 AI 落子的最坏耗时」，否则锁会在 AI 思考途中过期，
+# 导致 SSE 误判 AI 已停、重新触发第二个 AI 线程（重复落子 / 双线程竞态）。
+# 最坏耗时 ≈ LLM_CALL_DEADLINE(45s) + 截断升级预算重试一次(by Fix A 已降为 1~2 个请求, 每个≤35s)
+#           ≈ 70s，故取 120s 留足余量。（锁真正的释放靠 do_ai_move 的 finally: release_lock，
+#           这里 TTL 仅是「线程真崩溃」时的兜底安全网。）
+AI_LOCK_TTL = 120.0
 ai_move_locks = {}
 ai_move_locks_lock = threading.Lock()
 
@@ -157,16 +162,32 @@ def get_state(game_id: int, db: Session = Depends(get_db)):
     game = get_game(db, game_id)
     if not game:
         raise HTTPException(status_code=404, detail="对局不存在")
+    try:
+        board = json.loads(game.board)
+    except json.JSONDecodeError:
+        board = [[0]*15 for _ in range(15)]
+    try:
+        history = json.loads(game.history)
+    except json.JSONDecodeError:
+        history = []
+    try:
+        logs = json.loads(game.logs)
+    except json.JSONDecodeError:
+        logs = []
+    try:
+        scores = json.loads(game.scores)
+    except json.JSONDecodeError:
+        scores = {"black": 0, "white": 0}
     return {
         "id": game.id,
         "room_id": game.room_id,
-        "board": json.loads(game.board),
+        "board": board,
         "turn": game.turn,
-        "history": json.loads(game.history),
+        "history": history,
         "winner": game.winner,
-        "logs": json.loads(game.logs),
+        "logs": logs,
         "status": game.status,
-        "scores": json.loads(game.scores)
+        "scores": scores
     }
 
 

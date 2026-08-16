@@ -85,7 +85,7 @@ def update_game_board(db: Session, game_id: int, board: list, turn: int, history
         game.turn = turn
         game.history = json.dumps(history)
         game.winner = winner
-        game.logs = json.dumps(logs[-50:])
+        game.logs = json.dumps(logs[-500:])  # 500 条 ≈ 整局（225 手×2）完整日志
         game.status = status
         db.commit()
         db.refresh(game)

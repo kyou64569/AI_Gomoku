@@ -59,7 +59,7 @@ def update_game_board(db: Session, game_id: int, board: list, turn: int, history
         game.turn = turn
         game.history = json.dumps(history)
         game.winner = winner
-        game.logs = json.dumps(logs[-50:])
+        game.logs = json.dumps(logs[-500:])  # 500 条 ≈ 整局（225 手×2）完整日志
         game.status = status
         db.commit()
         db.refresh(game)
@@ -128,7 +128,7 @@ def handle_move(db: Session, game_id: int, player: int, row: int, col: int,
     game.turn = turn
     game.history = json.dumps(history)
     game.winner = winner
-    game.logs = json.dumps(logs[-50:])
+    game.logs = json.dumps(logs[-500:])  # 500 条 ≈ 整局（225 手×2）完整日志
     db.commit()
     db.refresh(game)
     return game
@@ -196,7 +196,7 @@ def ai_turn(db: Session, game_id: int, model_config: dict, player_name: str,
                 except json.JSONDecodeError:
                     logs = []
                 logs.append(f"[{player_name}] {reason}")
-                game.logs = json.dumps(logs[-50:])
+                game.logs = json.dumps(logs[-500:])  # 500 条 ≈ 整局（225 手×2）完整日志
                 db.commit()
         except Exception:
             pass  # 日志追加失败不影响主流程

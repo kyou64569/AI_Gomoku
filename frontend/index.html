@@ -417,6 +417,21 @@
     .config-sec h3 .num { width: 22px; height: 22px; border-radius: 7px; background: var(--amber-dim); color: var(--amber);
       display: inline-flex; align-items: center; justify-content: center; font-size: 12px; }
     .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+
+    /* ============ 历史页 ============ */
+    .rank-list { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+    .rank-row { display: flex; align-items: center; gap: 12px; padding: 9px 12px; background: var(--surface-2); border-radius: 8px; }
+    .rank-row.rank-top { border: 1px solid rgba(232,180,90,.45); background: rgba(232,180,90,.07); }
+    .rank-badge { width: 26px; height: 26px; border-radius: 50%; background: var(--surface-3); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+    .rank-row.rank-top .rank-badge { background: var(--amber); color: #0d1220; }
+    .rank-name { flex: 1; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rank-stat { color: var(--text-2); font-size: 12px; white-space: nowrap; }
+    .rank-points { color: var(--amber); font-weight: 700; white-space: nowrap; }
+    .table-wrap { overflow-x: auto; margin-top: 14px; }
+    .hist-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .hist-table th, .hist-table td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    .hist-table th { color: var(--text-2); font-weight: 600; font-size: 12px; }
+    .hist-table tr:hover td { background: rgba(255,255,255,.02); }
     .form-grid .full { grid-column: 1 / -1; }
     .field label { display: block; font-size: 12px; color: var(--text-3); margin-bottom: 6px; letter-spacing: 0.08em; }
     .range-row { display: flex; align-items: center; gap: 10px; }
@@ -530,6 +545,8 @@
       editingPlayerId: null, // 正在编辑的 AI 玩家 id
       _moving: false,
       _boardKey: '', // 上一帧棋盘 JSON，用于识别"新落子"以触发动画
+      _viewingResult: false, // 终局后点击"查看棋局"进入只读回顾
+      history: null, // 历史页数据 {games, ranking}
     };
 
     async function api(path, opts = {}) {
@@ -578,7 +595,7 @@
             ${message ? `<div class="modal-message">${message}</div>` : ''}
             ${bodyHTML ? `<div class="modal-body">${bodyHTML}</div>` : ''}
             <div class="modal-actions">
-              <button class="btn btn-ghost" data-act="cancel">${cancelText}</button>
+              ${cancelText ? `<button class="btn btn-ghost" data-act="cancel">${cancelText}</button>` : ''}
               <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-act="ok">${confirmText}</button>
             </div>
           </div>`;
@@ -590,7 +607,8 @@
           resolve(val);
         }
         overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
-        overlay.querySelector('[data-act=cancel]').addEventListener('click', () => close(null));
+        const cancelBtn = overlay.querySelector('[data-act=cancel]');
+        if (cancelBtn) cancelBtn.addEventListener('click', () => close(null));
         overlay.querySelector('[data-act=ok]').addEventListener('click', () => {
           const result = {};
           overlay.querySelectorAll('[data-field]').forEach(el => { result[el.dataset.field] = el.value; });
@@ -1107,6 +1125,7 @@
                   ${canStart
                     ? `<button class="btn btn-primary btn-sm" onclick="startRoom(${r.id})">${isWaiting ? '开始对局' : '再来一局'}</button>`
                     : `<button class="btn btn-primary btn-sm" onclick="enterRoom(${r.id}, ${r.game_id ?? null})">进入观战</button>`}
+                  ${!isWaiting && r.game_id ? `<button class="btn btn-ghost btn-sm" onclick="viewRoomGame(${r.id})">查看棋局</button>` : ''}
                   <button class="btn btn-ghost btn-sm" onclick="deleteRoom(${r.id})">删除</button>
                 </div>
               </div>`;
@@ -1228,18 +1247,18 @@
       else if (state.mode === 'watch') { badgeText = 'AI 对弈中'; badgeDot = true; }
       else { badgeText = '对局进行中'; badgeDot = true; }
 
-      // 玩家卡激活态：当前回合方高亮；AI 思考时显示 spinner
-      const blackActive = playing && state.game.turn === 1;
-      const whiteActive = playing && state.game.turn === 2;
-      const blackThinking = blackActive && aiThinking;
-      const whiteThinking = whiteActive && aiThinking;
+      // 玩家卡激活态：当前回合方高亮；终局查看时获胜方高亮；AI 思考时显示 spinner
+      const blackActive = (playing && state.game.turn === 1) || ((finished || draw) && state.game?.winner === 1);
+      const whiteActive = (playing && state.game.turn === 2) || ((finished || draw) && state.game?.winner === 2);
+      const blackThinking = playing && blackActive && aiThinking;
+      const whiteThinking = playing && whiteActive && aiThinking;
 
       const statusText = finished ? '黑方胜' : draw ? '平局' : '进行中';
       const turnText = finished ? '已结束' : draw ? '平局' : (state.game.turn === 1 ? '黑方' : '白方');
       const modeText = state.mode === 'pve' ? '人机对弈' : 'AI 观战';
 
       let resultOverlay = '';
-      if (finished || draw) {
+      if ((finished || draw) && !state._viewingResult) {
         resultOverlay = `
           <div class="result-overlay">
             <div class="result-card">
@@ -1248,6 +1267,7 @@
               <div class="result-sub">本局共 ${stoneCount} 手 · ${modeText}</div>
               <div class="result-actions">
                 <button class="btn btn-primary" onclick="restartGame()">再来一局</button>
+                <button class="btn btn-ghost" onclick="viewFinishedGame()">查看棋局</button>
                 <button class="btn btn-ghost" onclick="goHome()">返回首页</button>
               </div>
             </div>
@@ -1298,7 +1318,9 @@
             </div>
 
             <div class="game-controls">
-              <button class="btn btn-primary" id="btn-restart" onclick="restartGame()">重新开始</button>
+              ${state._viewingResult
+                ? `<button class="btn btn-ghost" onclick="closeViewFinished()">← 返回终局</button>`
+                : `<button class="btn btn-primary" id="btn-restart" onclick="restartGame()">重新开始</button>`}
               <button class="btn btn-ghost" onclick="goHome()">返回首页</button>
             </div>
           </section>
@@ -1322,6 +1344,66 @@
               <div class="log-list" id="log-list">${logsHTML}</div>
             </div>
           </aside>
+        </div>`;
+    }
+
+    /* ================= 历史页渲染 ================= */
+    function renderHistory() {
+      const data = state.history || { games: [], ranking: [] };
+
+      const rankRows = data.ranking.length === 0
+        ? '<div class="empty">暂无对局数据，先去下一局吧</div>'
+        : data.ranking.map((r, i) => `
+          <div class="rank-row ${i < 3 ? 'rank-top' : ''}">
+            <span class="rank-badge">${i + 1}</span>
+            <span class="rank-name">${escapeHtml(r.player)}</span>
+            <span class="rank-stat">${r.games} 局</span>
+            <span class="rank-stat">胜 ${r.wins}</span>
+            <span class="rank-stat">负 ${r.losses}</span>
+            <span class="rank-stat">平 ${r.draws}</span>
+            <span class="rank-stat">胜率 ${r.win_rate}%</span>
+            <span class="rank-points">${r.points} 分</span>
+          </div>`).join('');
+
+      const gameRows = data.games.length === 0
+        ? '<tr><td colspan="7" class="empty">暂无已结束对局</td></tr>'
+        : data.games.map(g => {
+            const resultText = g.status === 'draw'
+              ? '平局'
+              : (g.winner === 1 ? `${escapeHtml(g.black)} 胜` : `${escapeHtml(g.white)} 胜`);
+            let timeText = '—';
+            if (g.created_at) {
+              try {
+                timeText = new Date(g.created_at).toLocaleString('zh-CN', { hour12: false }).slice(0, 16);
+              } catch (_) { timeText = '—'; }
+            }
+            const modeText = g.mode === 'pve' ? '人机' : '观战';
+            return `<tr>
+              <td>${timeText}</td>
+              <td>${modeText}</td>
+              <td>${escapeHtml(g.black)}</td>
+              <td>${escapeHtml(g.white)}</td>
+              <td>${g.stones}</td>
+              <td>${resultText}</td>
+              <td><a class="btn btn-ghost btn-sm" href="#game/${g.id}">查看</a></td>
+            </tr>`;
+          }).join('');
+
+      return `
+        <div class="config-wrap">
+          <div class="card config-sec">
+            <h3><span class="num">🏆</span>积分排名</h3>
+            <div class="rank-list">${rankRows}</div>
+          </div>
+          <div class="card config-sec">
+            <h3><span class="num">📜</span>对战历史</h3>
+            <div class="table-wrap">
+              <table class="hist-table">
+                <thead><tr><th>时间</th><th>模式</th><th>黑方</th><th>白方</th><th>手数</th><th>结果</th><th></th></tr></thead>
+                <tbody>${gameRows}</tbody>
+              </table>
+            </div>
+          </div>
         </div>`;
     }
 
@@ -1518,7 +1600,29 @@
       }
     }
 
-    /* ================= 重新开始 / 返回 ================= */
+    /* ================= 终局回顾 / 重新开始 / 返回 ================= */
+    // 首页：查看已结束房间的对局（通过 hash 导航进对局页并打开只读回顾）
+    async function viewRoomGame(roomId) {
+      const room = state.rooms.find(r => r.id === roomId);
+      if (!room || !room.game_id) return toast('该房间暂无对局可查看', 'error');
+      location.href = `#game/${room.game_id}?view=1`; // 使用 URL 参数避免竞态条件
+    }
+    // 查看已结束棋局（只读：棋盘 + AI 思考日志 + 终局信息）
+    async function viewFinishedGame() {
+      state._viewingResult = true;
+      // SSE 只推送最近 10 条日志，回顾时拉取全量 logs
+      try {
+        const fresh = await api(`/games/${state.game.id}/state`);
+        if (fresh && Array.isArray(fresh.logs)) state.logs = fresh.logs;
+      } catch (_) { /* 拉取失败则用当前已有日志 */ }
+      render();
+    }
+    // 从回顾模式返回终局面板
+    function closeViewFinished() {
+      state._viewingResult = false;
+      render();
+    }
+
     async function restartGame() {
       const ok = await showModal({
         title: '重新开始',
@@ -1585,6 +1689,9 @@
       } else if (hash.startsWith('#game')) {
         const parts = hash.split('/');
         const id = Number(parts[1]);
+        // 检查 URL 参数中的 view=1 标志
+        const urlParams = new URLSearchParams(hash.split('?')[1] || '');
+        const viewMode = urlParams.get('view') === '1';
         if (id && !isNaN(id)) {
           if (!state.game || state.game.id !== id) {
             if (state._es) {
@@ -1594,12 +1701,23 @@
             state.game = null;
             state.logs = [];
             state._boardKey = '';
+            state._viewingResult = viewMode; // 从 URL 参数设置回顾模式
             await loadGame(id);
+          } else if (viewMode) {
+            state._viewingResult = true; // 切换到回顾模式
           }
           app.innerHTML = topbar('对局', `<span class="game-chip">对局 #${id}</span><a class="btn btn-ghost btn-sm" href="/">返回</a>`) + renderGame();
         } else {
           app.innerHTML = topbar('无效对局', '') + '<div class="empty" style="padding:60px 20px">无效的对局链接，请从首页进入。</div>';
         }
+      } else if (hash.startsWith('#history')) {
+        // 历史页：对战历史 + 积分排名
+        try {
+          state.history = await api('/history/');
+        } catch (e) {
+          /* 拉取失败保留旧数据 */
+        }
+        app.innerHTML = topbar('历史', '<a class="btn btn-ghost btn-sm" href="/">返回首页</a>') + renderHistory();
       } else {
         // 首页：先刷新房间列表（反映 waiting/playing 最新状态，支持退出后按钮切换）
         try {
@@ -1607,7 +1725,7 @@
         } catch (e) {
           /* 拉取失败保留旧数据 */
         }
-        app.innerHTML = topbar('首页', '<a class="btn btn-ghost btn-sm" href="#config">⚙️ 配置管理</a>') + renderHome();
+        app.innerHTML = topbar('首页', '<a class="btn btn-ghost btn-sm" href="#config">⚙️ 配置管理</a><a class="btn btn-ghost btn-sm" href="#history">📊 历史</a>') + renderHome();
       }
     }
 
