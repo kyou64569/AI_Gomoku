@@ -1,9 +1,42 @@
 import json
 import random
+import threading
+import logging
 from sqlalchemy.orm import Session
 from ..models import Room, Game
 from ..services import game_logic
 from .llm_service import ai_move
+
+logger = logging.getLogger(__name__)
+
+# 进程内 per-game 落子锁：串行化同一 game_id 的 handle_move（人类 POST 与 AI daemon 线程并发时，
+# 消除"读棋盘 → 校验 → 写回"之间的 TOCTOU 竞态，避免一步覆盖另一步）。
+_move_locks = {}
+_move_locks_guard = threading.Lock()
+_MOVE_LOCKS_MAX_SIZE = 1000
+
+
+def cleanup_move_lock(game_id: int):
+    """清理指定对局的落子锁，防止内存泄漏"""
+    with _move_locks_guard:
+        _move_locks.pop(game_id, None)
+
+
+def _get_move_lock(game_id: int) -> threading.Lock:
+    with _move_locks_guard:
+        if len(_move_locks) >= _MOVE_LOCKS_MAX_SIZE and game_id not in _move_locks:
+            # 清理未加锁的空闲锁条目，防止无界膨胀
+            for gid in list(_move_locks.keys()):
+                l = _move_locks[gid]
+                if not l.locked():
+                    _move_locks.pop(gid, None)
+                if len(_move_locks) < _MOVE_LOCKS_MAX_SIZE // 2:
+                    break
+        lock = _move_locks.get(game_id)
+        if lock is None:
+            lock = threading.Lock()
+            _move_locks[game_id] = lock
+        return lock
 
 
 def create_room(db: Session, mode: str, seats: list):
@@ -29,6 +62,10 @@ def get_room(db: Session, room_id: int):
 def delete_room(db: Session, room_id: int):
     room = db.query(Room).filter(Room.id == room_id).first()
     if room:
+        # 先清理关联对局的落子锁
+        game_ids = [g[0] for g in db.query(Game.id).filter(Game.room_id == room_id).all()]
+        for gid in game_ids:
+            cleanup_move_lock(gid)
         # 先删除关联的 Game
         db.query(Game).filter(Game.room_id == room_id).delete()
         db.delete(room)
@@ -68,6 +105,14 @@ def update_game_board(db: Session, game_id: int, board: list, turn: int, history
 
 def handle_move(db: Session, game_id: int, player: int, row: int, col: int,
                 player_name: str = "Player", expected_player_id=None, forbidden: bool = False):
+    # 串行化同一对局的落子：锁内完成"读-校验-写"，杜绝并发覆盖（TOCTOU）
+    with _get_move_lock(game_id):
+        return _handle_move_locked(db, game_id, player, row, col, player_name,
+                                   expected_player_id, forbidden)
+
+
+def _handle_move_locked(db: Session, game_id: int, player: int, row: int, col: int,
+                        player_name: str, expected_player_id, forbidden: bool):
     game = db.query(Game).filter(Game.id == game_id).first()
     if not game or game.status != "playing":
         return None
@@ -198,6 +243,10 @@ def ai_turn(db: Session, game_id: int, model_config: dict, player_name: str,
                 logs.append(f"[{player_name}] {reason}")
                 game.logs = json.dumps(logs[-500:])  # 500 条 ≈ 整局（225 手×2）完整日志
                 db.commit()
-        except Exception:
-            pass  # 日志追加失败不影响主流程
+        except Exception as e:
+            # 日志追加失败不影响主流程，但必须记录，避免静默丢失决策原因
+            logger.warning("AI 日志追加失败 game_id=%s: %s", game_id, e)
+    else:
+        logger.warning("AI 落子被拒绝 game_id=%s player=%s (%s,%s) reason=%s forbidden=%s",
+                       game_id, player_name, row, col, reason, forbidden)
     return result

@@ -6,7 +6,12 @@ rem --- safe code page switch (fail-quiet so it never kills the script) ---
 chcp 65001 >nul 2>&1
 
 rem --- constants ---
-set "PY=C:\Users\asus\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+rem Prefer PYTHON_PATH env var; fall back to managed Python 3.13.12; then py -3.10.
+if defined PYTHON_PATH (
+    set "PY=%PYTHON_PATH%"
+) else (
+    set "PY=C:\Users\asus\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+)
 set "BACKEND=%~dp0backend"
 set "HOST=0.0.0.0"
 set "PREFERRED_PORT=8000"
@@ -43,7 +48,7 @@ if errorlevel 1 (
 ) else (
     set "PY_VERSION=managed-3.13.12"
 )
-echo [INFO] Python: !PY! (%PY_VERSION%)
+echo [INFO] Python: %PY% (%PY_VERSION%)
 
 rem --- port detection: probe 8000..8099, pick the first LISTEN-free port ---
 set "FINAL_PORT="
@@ -80,20 +85,20 @@ echo [STOP]  Close the "AI Gomoku Backend" window, or run stop.bat
 echo.
 
 rem --- launch server in a dedicated window (logs visible, independent of this script) ---
-if "!PY!"=="py" (
-    start "AI Gomoku Backend" py -m uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
+rem Use %PY% for standard variable expansion and pass /D "%BACKEND%" explicitly so
+rem uvicorn reliably finds the "app" package regardless of the host cmd's cwd.
+if "%PY%"=="py" (
+    start "AI Gomoku Backend" /D "%BACKEND%" py -m uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
 ) else (
-    start "AI Gomoku Backend" "!PY!" -m uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
+    start "AI Gomoku Backend" /D "%BACKEND%" "%PY%" -m uvicorn app.main:app --reload --host %HOST% --port %FINAL_PORT%
 )
 
-rem --- wait for server readiness (poll port, up to ~30s) ---
+rem --- wait for server readiness (poll HTTP /docs via PowerShell, up to ~40s) ---
 set "READY=0"
-for /L %%T in (1,1,30) do (
-    netstat -ano | findstr " LISTENING " | findstr ":%FINAL_PORT% " >nul 2>&1
+for /L %%T in (1,1,40) do (
+    powershell -NoProfile -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:%FINAL_PORT%/docs' -UseBasicParsing -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
     if not errorlevel 1 (
         set "READY=1"
-        rem --- additional delay to ensure server is fully ready ---
-        timeout /t 2 >nul 2>&1
         goto :OPEN_BROWSER
     )
     timeout /t 1 >nul 2>&1

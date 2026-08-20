@@ -96,6 +96,12 @@ def test_room_start_robust_when_room_status_stale(client, db_session):
     game_b = s2.json()["game_id"]
     assert game_b != game_a
 
+    # 细粒度验证：新对局确实是独立新局，旧对局状态未被误改
+    g_a = get_game(db_session, game_a)
+    assert g_a.status == "finished", "旧对局应保持 finished 不被覆盖"
+    g_b = get_game(db_session, game_b)
+    assert g_b is not None and g_b.status == "playing", "新对局应处于 playing"
+
 
 def test_list_rooms_returns_game_status(client, db_session):
     """房间列表应返回最新对局的实际状态，供前端判断按钮是"再来一局"还是"进入观战"。"""

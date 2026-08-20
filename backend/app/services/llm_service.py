@@ -355,6 +355,72 @@ _combo_cache_lock = threading.Lock()
 _COMBO_CACHE_MAX_SIZE = 100  # 最多缓存 100 个不同模型的组合
 _COMBO_CACHE_TTL = 3600.0  # 缓存 TTL：1 小时后失效（应对 API 兼容性变化）
 
+# ============ OpenAI 客户端复用缓存 ============
+# 避免每次调用都新建 OpenAI 客户端（内部含 httpx 连接池，频繁创建导致 TCP/TLS 无法复用）。
+# 按 (base_url, api_key) 缓存，带 TTL、容量上限与线程安全保护。
+_clients = {}  # key: (base_url, api_key) -> {"client": OpenAI, "last_used": timestamp}
+_clients_lock = threading.Lock()
+_CLIENTS_CACHE_MAX_SIZE = 50
+_CLIENTS_CACHE_TTL = 3600.0
+
+
+def clear_client_cache(base_url: str = None, api_key: str = None):
+    """主动清理 OpenAI 客户端缓存，释放底层连接池。"""
+    with _clients_lock:
+        if base_url is None and api_key is None:
+            for item in list(_clients.values()):
+                try:
+                    item["client"].close()
+                except Exception:
+                    pass
+            _clients.clear()
+        else:
+            keys_to_del = [
+                k for k in _clients
+                if (base_url is None or k[0] == base_url) and (api_key is None or k[1] == api_key)
+            ]
+            for k in keys_to_del:
+                item = _clients.pop(k, None)
+                if item:
+                    try:
+                        item["client"].close()
+                    except Exception:
+                        pass
+
+
+def _get_client(base_url: str, api_key: str) -> OpenAI:
+    cache_key = (base_url, api_key)
+    now = time.monotonic()
+    with _clients_lock:
+        # 惰性清理过期条目
+        expired_keys = [k for k, v in _clients.items() if now - v["last_used"] > _CLIENTS_CACHE_TTL]
+        for k in expired_keys:
+            old = _clients.pop(k, None)
+            if old:
+                try:
+                    old["client"].close()
+                except Exception:
+                    pass
+
+        item = _clients.get(cache_key)
+        if item is not None:
+            item["last_used"] = now
+            return item["client"]
+
+        # 容量淘汰（LRU）：若达到上限，淘汰最久未使用的
+        if len(_clients) >= _CLIENTS_CACHE_MAX_SIZE:
+            oldest_key = min(_clients.keys(), key=lambda k: _clients[k]["last_used"])
+            old = _clients.pop(oldest_key, None)
+            if old:
+                try:
+                    old["client"].close()
+                except Exception:
+                    pass
+
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=TIMEOUT)
+        _clients[cache_key] = {"client": client, "last_used": now}
+        return client
+
 
 def _combo_signature(combo: dict) -> tuple:
     """组合的结构化指纹（排除 messages / max_tokens：每次落子内容与预算不同，
@@ -383,7 +449,7 @@ def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=
     - reasoning 类模型思考可能超预算：512 截断（finish_reason=length）→ 用 8192 重试一次
     - JSON 解析失败（reasoning 模型偶发输出不完整）→ 自动重试一次
     """
-    client = OpenAI(base_url=base_url, api_key=api_key, timeout=TIMEOUT)
+    client = _get_client(base_url, api_key)
     messages = [
         {"role": "system", "content": "你是五子棋AI，严格只返回合法JSON，格式：{\"row\": 0, \"col\": 0, \"reason\": \"理由\"}"},
         {"role": "user", "content": prompt}
@@ -490,8 +556,21 @@ def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=
         end = content.rfind("}")
         if start >= 0 and end > start:
             content = content[start:end + 1]
-        data = json.loads(content)
-        row, col = int(data["row"]), int(data["col"])
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            return None, None, f"LLM 返回 JSON 解析失败: {e}"
+        if not isinstance(data, dict):
+            return None, None, "LLM 返回格式错误：不是 JSON 对象"
+        row_raw = data.get("row")
+        col_raw = data.get("col")
+        if row_raw is None or col_raw is None:
+            # 防御：LLM 返回合法 JSON 但缺 row/col（如 {"move": "7,7"}）→ 明确错误信息
+            return None, None, "LLM 返回格式错误：缺少 row/col 字段"
+        try:
+            row, col = int(row_raw), int(col_raw)
+        except (TypeError, ValueError):
+            return None, None, f"LLM 返回格式错误：row/col 非整数 ({row_raw!r}, {col_raw!r})"
         reason = data.get("reason", "")
         return row, col, reason
     return None, None, last_err

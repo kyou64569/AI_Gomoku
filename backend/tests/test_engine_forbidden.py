@@ -1,5 +1,7 @@
 import sys
+from unittest.mock import patch
 sys.path.insert(0, ".")
+import app.services.llm_service as llm_service_module
 from app.services.game_logic import create_board, place_stone, is_forbidden_move, check_win, is_valid_move, count_line
 from app.services.llm_service import engine_best_move, ai_move, shape_score, SCORE_WIN, SCORE_LIVE_FOUR, SCORE_DEAD_FOUR, SCORE_LIVE_THREE
 
@@ -25,14 +27,12 @@ def test_forbidden_five_not_forbidden():
 def test_forbidden_double_three():
     # 构造横活三 + 竖活三交叉点 (7,5)，黑棋落子成双三 = 禁手
     board = create_board()
-    # 横：_1_1_1_ 形态，(7,5) 补位 → _11111_? 不，构造 (7,3),(7,4),(7,6) 活三
+    # 横：(7,3),(7,4) 落 (7,5) → (7,3)(7,4)(7,5) 三连，两端 (7,2)(7,6) 开放 = 活三
     board[7][3] = 1
     board[7][4] = 1
-    board[7][6] = 1
-    # 竖：(5,5),(6,5),(8,5) 活三
+    # 竖：(5,5),(6,5) 落 (7,5) → (5,5)(6,5)(7,5) 三连，两端 (4,5)(8,5) 开放 = 活三
     board[5][5] = 1
     board[6][5] = 1
-    board[8][5] = 1
     assert is_forbidden_move(board, 7, 5, 1) is True
 
 
@@ -50,12 +50,17 @@ def test_forbidden_double_four():
 
 
 def test_white_no_forbidden():
-    # 白棋不受禁手限制
+    # 白棋不受禁手限制：即使形成六连（黑棋长连为禁手，白棋不禁手）
     board = create_board()
-    for c in range(4):
-        board[7][c] = 2
-    board[7][5] = 1
-    assert is_forbidden_move(board, 7, 4, 2) is False
+    for c in range(6):
+        board[7][c] = 2  # 白棋六连
+    assert is_forbidden_move(board, 7, 6, 2) is False  # 白棋六连不禁手（且 (7,6) 已被占，返回 False）
+    # 更严格：白棋落子形成长连也不判禁手（构造 5 连后补第 6 子）
+    board2 = create_board()
+    for c in range(5):
+        board2[7][c] = 2
+    # 白棋在 (7,5) 落子形成六连 → 白棋无禁手，返回 False
+    assert is_forbidden_move(board2, 7, 5, 2) is False
 
 
 # ============ 评分引擎棋力 ============
@@ -105,17 +110,19 @@ def test_engine_blocks_enemy_live_three():
 
 
 def test_ai_move_without_llm():
-    # LLM 配置不可用（bad url）时，ai_move 也应通过引擎给出合法落子
+    # LLM 配置不可用（mock 直接失败）时，ai_move 也应通过引擎给出合法落子。
+    # 用 mock 替代真实网络（127.0.0.1:9 连接拒绝虽快，但引入网络/环境不确定性）。
     board = create_board()
     board[7][7] = 1  # 黑开局
     model_config = {"base_url": "http://127.0.0.1:9", "api_key": "x", "model_id": "x", "temperature": 0.5}
-    row, col, reason = ai_move(board, 2, [], model_config, "AI", forbidden=False)
+    with patch.object(llm_service_module, "call_llm", return_value=(None, None, "mock: LLM 不可用")):
+        row, col, reason = ai_move(board, 2, [], model_config, "AI", forbidden=False)
     assert is_valid_move(board, row, col), f"非法落子 ({row},{col})"
     assert reason.startswith("引擎"), f"应走引擎，实际 reason={reason}"
 
 
 def test_ai_move_respects_forbidden():
-    # 黑棋面对禁手局面时，引擎不应选中禁手点
+    # 黑棋面对禁手局面时，引擎不应选中禁手点（mock 掉 LLM，纯引擎决策）
     board = create_board()
     board[7][3] = 1
     board[7][4] = 1
@@ -124,6 +131,7 @@ def test_ai_move_respects_forbidden():
     board[6][5] = 1
     board[8][5] = 1
     model_config = {"base_url": "http://127.0.0.1:9", "api_key": "x", "model_id": "x", "temperature": 0.5}
-    row, col, reason = ai_move(board, 1, [], model_config, "AI", forbidden=True)
+    with patch.object(llm_service_module, "call_llm", return_value=(None, None, "mock: LLM 不可用")):
+        row, col, reason = ai_move(board, 1, [], model_config, "AI", forbidden=True)
     assert is_valid_move(board, row, col)
     assert not is_forbidden_move(board, row, col, 1), f"选中禁手点 ({row},{col})"

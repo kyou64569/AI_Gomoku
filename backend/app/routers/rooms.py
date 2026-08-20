@@ -1,12 +1,41 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from typing import List
+import threading
 from ..database import get_db
 from ..services.room_service import create_room as room_service_create, get_room, start_game, delete_room as delete_room_service
 from ..models import Room, Game
 import json
 
 router = APIRouter(prefix="/api/rooms", tags=["rooms"])
+
+# 进程内房间锁：串行化同一 room_id 的 start_room，消除"查询-创建"之间的 TOCTOU 竞态
+_room_start_locks = {}
+_room_start_locks_guard = threading.Lock()
+_ROOM_LOCKS_MAX_SIZE = 500
+
+
+def _cleanup_room_lock(room_id: int):
+    """清理指定房间锁，防止内存泄漏"""
+    with _room_start_locks_guard:
+        _room_start_locks.pop(room_id, None)
+
+
+def _get_room_lock(room_id: int) -> threading.Lock:
+    with _room_start_locks_guard:
+        if len(_room_start_locks) >= _ROOM_LOCKS_MAX_SIZE and room_id not in _room_start_locks:
+            # 清理未加锁的空闲锁条目，防止无界膨胀
+            for rid in list(_room_start_locks.keys()):
+                l = _room_start_locks[rid]
+                if not l.locked():
+                    _room_start_locks.pop(rid, None)
+                if len(_room_start_locks) < _ROOM_LOCKS_MAX_SIZE // 2:
+                    break
+        lock = _room_start_locks.get(room_id)
+        if lock is None:
+            lock = threading.Lock()
+            _room_start_locks[room_id] = lock
+        return lock
 
 
 @router.post("/")
@@ -54,17 +83,19 @@ def start_room(room_id: int, db: Session = Depends(get_db)):
     room = get_room(db, room_id)
     if not room:
         raise HTTPException(status_code=404, detail="房间不存在")
-    # 幂等：若房间内存在"进行中"的对局，直接返回它（兼容前端缓存过期、双标签 race、
-    # 重复点击等场景）。以 Game.status 为准，避免 Room.status 未同步时返回已结束的旧局。
-    existing_game = db.query(Game).filter(
-        Game.room_id == room_id, Game.status == "playing"
-    ).order_by(Game.id.desc()).first()
-    if existing_game:
-        return {"game_id": existing_game.id, "status": "playing"}
-    game = start_game(db, room_id)
-    room.status = "playing"
-    db.commit()
-    return {"game_id": game.id, "status": "playing"}
+    # 进程内锁串行化同一房间的开局，消除并发"双查-双建"竞态（TOCTOU）
+    with _get_room_lock(room_id):
+        # 幂等：若房间内存在"进行中"的对局，直接返回它（兼容前端缓存过期、双标签 race、
+        # 重复点击等场景）。以 Game.status 为准，避免 Room.status 未同步时返回已结束的旧局。
+        existing_game = db.query(Game).filter(
+            Game.room_id == room_id, Game.status == "playing"
+        ).order_by(Game.id.desc()).first()
+        if existing_game:
+            return {"game_id": existing_game.id, "status": "playing"}
+        game = start_game(db, room_id)
+        room.status = "playing"
+        db.commit()
+        return {"game_id": game.id, "status": "playing"}
 
 
 @router.delete("/{room_id}")
@@ -72,4 +103,5 @@ def delete_room(room_id: int, db: Session = Depends(get_db)):
     success = delete_room_service(db, room_id)
     if not success:
         raise HTTPException(status_code=404, detail="房间不存在")
+    _cleanup_room_lock(room_id)
     return {"status": "deleted"}

@@ -2,11 +2,11 @@ import json
 import asyncio
 import threading
 import time
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from ..database import get_db, SessionLocal
-from ..services.room_service import get_game, handle_move, ai_turn, get_room
+from ..services.room_service import get_game, handle_move, ai_turn, get_room, cleanup_move_lock
 from ..services.config_helper import resolve_api_key
 from ..models import Game, AIPlayer, ModelConfig, Room
 
@@ -25,9 +25,10 @@ ai_move_locks_lock = threading.Lock()
 
 
 def cleanup_ai_move_lock(game_id: int):
-    """清理已结束游戏的 AI 移动锁，防止内存泄漏"""
+    """清理已结束游戏的 AI 移动锁和落子锁，防止内存泄漏"""
     with ai_move_locks_lock:
         ai_move_locks.pop(game_id, None)
+    cleanup_move_lock(game_id)
 
 
 def is_ai_lock_expired(timestamp: float) -> bool:
@@ -37,11 +38,17 @@ def is_ai_lock_expired(timestamp: float) -> bool:
 
 def acquire_ai_lock(game_id: int) -> bool:
     """尝试获取 AI 落子锁，返回是否成功"""
+    now = time.monotonic()
     with ai_move_locks_lock:
+        # 惰性清理所有过期锁条目，防止无终局 SSE 订阅的对局遗留内存泄露
+        expired = [gid for gid, ts in ai_move_locks.items() if now - ts > AI_LOCK_TTL]
+        for gid in expired:
+            ai_move_locks.pop(gid, None)
+
         current = ai_move_locks.get(game_id)
         # 如果锁不存在或已过期，可以获取
         if current is None or is_ai_lock_expired(current):
-            ai_move_locks[game_id] = time.monotonic()
+            ai_move_locks[game_id] = now
             return True
         return False
 
@@ -83,6 +90,12 @@ def trigger_ai_if_needed(game_id, db):
             ai_move_locks.pop(game_id, None)
     
     try:
+        # 刷新缓存：SSE 长连接的 session 可能持有旧 identity map，
+        # 用户刚改的 AIPlayer / ModelConfig 配置需要重新查询才能拿到最新值。
+        try:
+            db.expire_all()
+        except Exception:
+            pass
         game = get_game(db, game_id)
         if not game or game.status != "playing":
             print(f"[AI] game={game_id} skipped: game not playing (status={game.status if game else 'None'})")
@@ -215,7 +228,7 @@ def make_move(game_id: int, row: int = Body(...), col: int = Body(...), db: Sess
 
 
 @router.get("/{game_id}/stream")
-def stream_game(game_id: int, db: Session = Depends(get_db)):
+def stream_game(game_id: int, request: Request):
     async def event_stream():
         last_board = None
         last_status = None
@@ -227,14 +240,21 @@ def stream_game(game_id: int, db: Session = Depends(get_db)):
                 timestamp = ai_move_locks.get(game_id)
                 return timestamp is not None and not is_ai_lock_expired(timestamp)
 
+        # SSE 是长连接，不能复用请求级 db session（生命周期随请求结束而失效）。
+        # 这里在生成器内部创建独立 session，并在 finally 中确保关闭。
+        sse_db = SessionLocal()
         try:
             while True:
+                # 客户端断开检测：断开后立即退出，避免无限轮询浪费资源/占用连接
+                if await request.is_disconnected():
+                    print(f"[SSE] game={game_id} client disconnected, closing stream")
+                    break
                 # 关键修复：SSE 这个 db session 是长连接的，主线程（POST /move）
                 # 和 AI daemon 线程（用 SessionLocal）提交后不会自动失效本 session 的
                 # identity map 缓存。先 expire_all 让下条 SELECT 真实发 SQL 拿最新。
                 try:
-                    db.expire_all()
-                    game = get_game(db, game_id)
+                    sse_db.expire_all()
+                    game = get_game(sse_db, game_id)
                     if not game:
                         yield f"event: error\ndata: 对局不存在\n\n"
                         break
@@ -247,13 +267,13 @@ def stream_game(game_id: int, db: Session = Depends(get_db)):
                     ai_pending = False
                     # 人机模式和观战模式：如果轮到 AI，自动触发 AI 落子
                     if status == "playing":
-                        room = db.query(Room).filter(Room.id == game.room_id).first()
+                        room = sse_db.query(Room).filter(Room.id == game.room_id).first()
                         if room and room.mode in ("pve", "watch"):
-                            if not is_human_turn(db, game_id, game.turn):
+                            if not is_human_turn(sse_db, game_id, game.turn):
                                 if not get_ai_pending():
                                     print(f"[SSE] game={game_id} triggering AI, turn={game.turn}")
-                                    trigger_ai_if_needed(game_id, db)
-                                db.refresh(game)
+                                    trigger_ai_if_needed(game_id, sse_db)
+                                sse_db.refresh(game)
                                 board = json.loads(game.board)
                                 status = game.status
                                 winner = game.winner
@@ -291,6 +311,7 @@ def stream_game(game_id: int, db: Session = Depends(get_db)):
                     print(f"[SSE] game={game_id} loop error (continue): {type(loop_e).__name__}: {loop_e}")
                     await asyncio.sleep(1)
         finally:
+            sse_db.close()
             # 不在 SSE 断开时清理 AI 锁：锁生命周期由 do_ai_move 线程负责
             # （受 LLM_CALL_DEADLINE=45s 总上限约束，最坏 ~46s 内必然释放）。
             # 若在此清理，SSE 断连→清锁→重连会重复触发 AI（双线程竞态，AI 反复慢思考）。

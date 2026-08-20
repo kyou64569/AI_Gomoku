@@ -1,10 +1,14 @@
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 import logging
+import os
+import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 from .routers import configs_router, players_router, rooms_router, game_router, history_router
 from .models import Base
 from .database import engine
@@ -17,6 +21,14 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 Base.metadata.create_all(bind=engine)
+
+# ============ 可选 API Key 认证（P0：默认放行，设置 AUTH_TOKEN 后启用） ============
+# 单机/局域网默认不校验，保持开箱即用；需要防护时在 backend/.env 设置 AUTH_TOKEN，
+# 前端将请求头 X-Api-Key 带上同一 token 即可。未设置时完全放行，不影响现有调用方。
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
+
+# 排除认证的路径前缀：静态前端、OpenAPI 文档（浏览器直连需要）
+AUTH_EXEMPT_PREFIXES = ("/docs", "/redoc", "/openapi.json", "/favicon.ico", "/assets", "/static")
 
 
 def _migrate_schema():
@@ -58,12 +70,32 @@ _migrate_schema()
 
 app = FastAPI(title="AI Gomoku", version="1.0.0")
 
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if not AUTH_TOKEN:
+        return await call_next(request)
+    path = request.url.path
+    if path.startswith("/api"):
+        if not any(path.startswith(p) for p in AUTH_EXEMPT_PREFIXES):
+            provided = request.headers.get("X-Api-Key", "")
+            if provided != AUTH_TOKEN:
+                return JSONResponse(status_code=401, content={"detail": "未授权：X-Api-Key 无效或缺失"})
+    return await call_next(request)
+
+
+# CORS：允许来源支持环境变量覆盖（CORS_ORIGINS，逗号分隔），默认兼容本地开发端口
+_cors_origins = [o.strip() for o in os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000",
+).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://127.0.0.1:3000"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Api-Key"],
 )
 
 app.include_router(configs_router)
@@ -72,4 +104,6 @@ app.include_router(rooms_router)
 app.include_router(game_router)
 app.include_router(history_router)
 
-app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
+# 前端静态目录：基于 __file__ 的绝对路径，不依赖启动 CWD
+FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
+app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

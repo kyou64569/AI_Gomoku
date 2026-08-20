@@ -6,7 +6,7 @@ from ..services import get_ai_player, create_ai_player, list_ai_players, delete_
 from ..services.config_helper import resolve_api_key
 from ..services.llm_service import call_llm, build_prompt, TEMPERATURE
 from ..services.game_logic import create_board
-from ..models import AIPlayer
+from ..models import AIPlayer, ModelConfig
 
 router = APIRouter(prefix="/api/players", tags=["players"])
 
@@ -18,6 +18,8 @@ def create_player(name: str = Body(...), model_config_id: int = Body(...), model
     # Convert to float range 0.0-2.0 by dividing by 100
     if not (0 <= temperature <= 200):
         raise HTTPException(status_code=400, detail="temperature 必须在 0-200 范围内（对应 OpenAI 的 0.0-2.0）")
+    if not get_model_config(db, model_config_id):
+        raise HTTPException(status_code=400, detail="模型配置不存在")
     return create_ai_player(db, name, model_config_id, model_id, temperature, reasoning_effort)
 
 
@@ -57,6 +59,9 @@ def update_player(player_id: int, name: str = Body(None), model_config_id: int =
     if name is not None:
         player.name = name
     if model_config_id is not None:
+        # 防止关联不存在的模型配置（否则 AI 落子时查询配置失败被静默跳过 → 游戏卡死）
+        if not get_model_config(db, model_config_id):
+            raise HTTPException(status_code=400, detail="模型配置不存在")
         player.model_config_id = model_config_id
     if model_id is not None:
         player.model_id = model_id

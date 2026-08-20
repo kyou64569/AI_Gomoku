@@ -1,7 +1,13 @@
+import os
+from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./gomoku.db"
+# 使用基于 __file__ 的绝对路径，避免依赖进程 CWD（不同目录启动不会产生"另一份数据库"）
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+SQLALCHEMY_DATABASE_URL = os.getenv(
+    "DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'gomoku.db'}"
+)
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 
 

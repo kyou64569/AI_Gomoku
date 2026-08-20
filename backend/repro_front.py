@@ -1,8 +1,11 @@
-"""前端视角复现：SSE 客户端 + 快速落子，检测前端 turn 与后端不一致的持续时间。"""
-import httpx, json, time, threading, random
+"""前端视角复现：SSE 客户端 + 快速落子，检测前端 turn 与后端不一致的持续时间。
 
-BASE = "http://localhost:8002"
-random.seed(7)
+用法：python repro_front.py [BASE_URL]  （默认读取环境变量 REPRO_BASE 或 localhost:8000）
+"""
+import httpx, json, time, threading, random, os, sys
+
+BASE = os.environ.get("REPRO_BASE", sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000")
+random.seed(int(os.environ.get("SEED", "7")))
 out = []
 
 r = httpx.post(f"{BASE}/api/rooms/", json={"mode": "pve", "seats": [{"role": "black", "player_id": None}, {"role": "white", "player_id": 4}]}, timeout=10).json()
@@ -80,5 +83,8 @@ out.append(f"共 {len(stale_events)} 次不一致（其中 >2s 持续才算卡�
 st = httpx.get(f"{BASE}/api/games/{game_id}/state", timeout=5).json()
 out.append(f"最终: turn={st['turn']} stones={sum(1 for row in st['board'] for c in row if c!=0)} status={st['status']}")
 httpx.delete(f"{BASE}/api/rooms/{room_id}", timeout=5)
-open('repro_out.txt','w',encoding='utf-8').write('\n'.join(out))
+# 输出文件路径与脚本同目录，用 with 确保正确关闭
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repro_out.txt")
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out))
 print('DONE')

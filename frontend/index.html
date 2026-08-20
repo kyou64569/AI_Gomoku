@@ -549,9 +549,30 @@
       history: null, // 历史页数据 {games, ranking}
     };
 
+    // 可选 API Key 认证：后端设置 AUTH_TOKEN 后，前端需带上同一 token。
+    // 配置方式二选一：1) 浏览器 localStorage 设置 gomoku_token；2) 页面加载前定义 window.AUTH_TOKEN。
+    function authHeaders() {
+      const token = window.AUTH_TOKEN || localStorage.getItem('gomoku_token');
+      return token ? { 'X-Api-Key': token } : {};
+    }
+
     async function api(path, opts = {}) {
-      const res = await fetch(API + path, { headers: { 'Content-Type': 'application/json' }, ...opts });
-      if (!res.ok) throw new Error(await res.text());
+      const res = await fetch(API + path, {
+        headers: { 'Content-Type': 'application/json', ...authHeaders(), ...(opts.headers || {}) },
+        ...opts,
+      });
+      if (!res.ok) {
+        // 优先提取 JSON 错误消息（detail 字段），HTML/其他内容截断前 200 字符
+        let msg = '';
+        try {
+          const data = await res.json();
+          msg = data.detail || data.message || JSON.stringify(data);
+        } catch (_) {
+          const text = await res.text().catch(() => '');
+          msg = text ? text.slice(0, 200) : `HTTP ${res.status}`;
+        }
+        throw new Error(msg || `HTTP ${res.status}`);
+      }
       return res.json();
     }
 
@@ -589,14 +610,15 @@
         overlay.className = 'modal-overlay';
         overlay.setAttribute('role', 'dialog');
         overlay.setAttribute('aria-modal', 'true');
+        // title / message 是用户可控文本，先转义再拼 HTML；bodyHTML 由调用方保证已转义
         overlay.innerHTML = `
           <div class="modal-card">
-            <div class="modal-title">${title}</div>
-            ${message ? `<div class="modal-message">${message}</div>` : ''}
+            <div class="modal-title">${escapeHtml(title)}</div>
+            ${message ? `<div class="modal-message">${escapeHtml(message)}</div>` : ''}
             ${bodyHTML ? `<div class="modal-body">${bodyHTML}</div>` : ''}
             <div class="modal-actions">
-              ${cancelText ? `<button class="btn btn-ghost" data-act="cancel">${cancelText}</button>` : ''}
-              <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-act="ok">${confirmText}</button>
+              ${cancelText ? `<button class="btn btn-ghost" data-act="cancel">${escapeHtml(cancelText)}</button>` : ''}
+              <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-act="ok">${escapeHtml(confirmText)}</button>
             </div>
           </div>`;
         document.body.appendChild(overlay);
@@ -625,30 +647,33 @@
 
     // 字段表单弹窗：fields = [{id,label,type,placeholder,value,options}]
     function promptFields({ title, fields }) {
+      // 所有动态值转义后再插入 HTML 属性/文本，防 DOM-based XSS
+      const esc = escapeHtml;
       const body = fields.map(f => {
         let control;
         if (f.type === 'range') {
           control = `
             <div class="range-row">
-              <input data-field="${f.id}" type="range" min="0" max="100" value="${f.value ?? 50}"
+              <input data-field="${esc(f.id)}" type="range" min="0" max="100" value="${esc(f.value ?? 50)}"
                      oninput="this.nextElementSibling.textContent=this.value" />
-              <span class="range-val">${f.value ?? 50}</span>
+              <span class="range-val">${esc(f.value ?? 50)}</span>
             </div>`;
         } else if (f.options && f.options.length) {
           // options 支持字符串或 {value, label} 对象
-          control = `<select data-field="${f.id}">${f.options.map(o =>
-            typeof o === 'object' ? `<option value="${o.value}">${o.label}</option>` : `<option value="${o}">${o}</option>`
+          control = `<select data-field="${esc(f.id)}">${f.options.map(o =>
+            typeof o === 'object' ? `<option value="${esc(o.value)}">${esc(o.label)}</option>` : `<option value="${esc(o)}">${esc(o)}</option>`
           ).join('')}</select>`;
         } else {
-          control = `<input data-field="${f.id}" type="${f.type || 'text'}" placeholder="${f.placeholder || ''}" value="${f.value || ''}" />`;
+          control = `<input data-field="${esc(f.id)}" type="${esc(f.type || 'text')}" placeholder="${esc(f.placeholder || '')}" value="${esc(f.value || '')}" />`;
         }
-        return `<div class="field"><label>${f.label}</label>${control}</div>`;
+        return `<div class="field"><label>${esc(f.label)}</label>${control}</div>`;
       }).join('');
       return showModal({ title, bodyHTML: `<div class="form-grid" style="grid-template-columns:1fr">${body}</div>` });
     }
 
     function showResultModal(title, text) {
-      return showModal({ title, bodyHTML: `<div class="modal-pre">${text}</div>`, confirmText: '知道了', cancelText: '' });
+      // text 可能来自 API 返回（含用户可控内容），用 escapeHtml 防 XSS
+      return showModal({ title, bodyHTML: `<div class="modal-pre">${escapeHtml(text)}</div>`, confirmText: '知道了', cancelText: '' });
     }
 
     async function confirmDanger(title, message, confirmText = '删除') {
@@ -658,13 +683,23 @@
 
     /* ================= 数据加载 ================= */
     async function loadConfigs() {
-      state.configs = await api('/configs/');
-      state.players = await api('/players/');
+      try {
+        state.configs = await api('/configs/');
+        state.players = await api('/players/');
+      } catch (e) {
+        console.error('[loadConfigs] 加载失败', e);
+        toast('配置加载失败: ' + (e.message || '网络错误'), 'error');
+      }
       render();
     }
 
     async function loadRooms() {
-      state.rooms = await api('/rooms/');
+      try {
+        state.rooms = await api('/rooms/');
+      } catch (e) {
+        console.error('[loadRooms] 加载失败', e);
+        toast('房间加载失败: ' + (e.message || '网络错误'), 'error');
+      }
       render();
     }
 
@@ -851,6 +886,10 @@
         state._es.close();
         state._es = null;
       }
+      if (state._hb) {
+        clearInterval(state._hb);
+        state._hb = null;
+      }
       if (!gameId || isNaN(gameId)) {
         toast('无效的对局ID', 'error');
         location.href = '/';
@@ -909,10 +948,13 @@
       }
       if (state._hb) { clearInterval(state._hb); state._hb = null; }
       let lastPushTime = Date.now();
+      let pushSeq = 0;
+      const MAX_SSE_RETRIES = 10;
       const es = new EventSource(`/api/games/${gameId}/stream`);
       state._es = es;
       state._es.gameId = gameId;
       console.log(`[SSE] connecting attempt=${attempt}`);
+      // 重连成功后清空重试计数，并全量拉取最新状态
       es.onopen = async () => {
         console.log('[SSE] open');
         attempt = 0;  // 连上后清零重试计数
@@ -930,6 +972,7 @@
         try {
           const data = JSON.parse(e.data);
           lastPushTime = Date.now();
+          pushSeq++;
           const prevStoneCount = (state.game?.board || []).reduce((s, r) => s + r.filter(c => c !== 0).length, 0);
           state.game = { ...state.game, ...data };
           state._aiPending = !!data.ai_pending;
@@ -953,6 +996,7 @@
           state.game.winner = data.winner;
           state._aiPending = false;
           lastPushTime = Date.now();
+          pushSeq++;
           render().catch(err => console.error('[render] error', err));
         } catch (err) {
           console.error('[SSE] game_over parse error', err);
@@ -963,12 +1007,24 @@
         console.error('[SSE] onerror', e, 'readyState=', es.readyState);
         // 终局状态就不重连
         if (state.game && (state.game.status === 'finished' || state.game.status === 'draw')) return;
+        // 用户已离开对局页则不再重连（避免离开后仍在后台反复建连）
+        if (!location.hash.startsWith('#game')) {
+          console.log('[SSE] 已离开对局页，停止重连');
+          if (state._hb) { clearInterval(state._hb); state._hb = null; }
+          return;
+        }
+        // 达到最大重试上限停止重连，防止服务宕机时无休止重试消耗资源
+        if (attempt >= MAX_SSE_RETRIES) {
+          console.warn(`[SSE] 已达到最大重连次数 (${MAX_SSE_RETRIES})，停止自动重连`);
+          if (state._hb) { clearInterval(state._hb); state._hb = null; }
+          return;
+        }
         // 只要连接不是 OPEN 就主动重建（EventSource 可能卡在 CONNECTING 不触发重连回调）
         if (es.readyState !== EventSource.OPEN) {
           es.close();
           const delay = Math.min(1000 * Math.pow(1.6, attempt), 10000);
           attempt += 1;
-          console.log(`[SSE] reconnecting in ${Math.round(delay)}ms (attempt ${attempt})`);
+          console.log(`[SSE] reconnecting in ${Math.round(delay)}ms (attempt ${attempt}/${MAX_SSE_RETRIES})`);
           setTimeout(() => connectSSE(gameId, attempt), delay);
         }
       };
@@ -978,14 +1034,19 @@
         if (!state.game || state.game.status === 'finished' || state.game.status === 'draw') return;
         if (Date.now() - lastPushTime > 4000) {
           console.log('[SSE] heartbeat: no push for 4s, syncing state...');
-          // 存储 fetch 前的 lastPushTime，防止 fetch 期间 SSE 推送新数据导致覆盖
-          const beforeFetch = lastPushTime;
+          // 存储 fetch 前的 pushSeq，防止 fetch 期间 SSE 推送新数据导致覆盖
+          const beforeSeq = pushSeq;
+          const beforeMoves = (state.game.history || []).length;
           try {
             const fresh = await api(`/games/${gameId}/state`);
-            // 只有在 fetch 期间没有新 SSE 推送时才应用心跳结果，避免用旧状态覆盖新状态
-            if (fresh && fresh.board && lastPushTime === beforeFetch) {
-              state.game = { ...state.game, ...fresh };
-              render().catch(err => console.error('[render] error', err));
+            // 双重保护：1) fetch 期间无新 SSE 推送（pushSeq 单调一致）；2) 服务端手数不落后于本地手数，
+            // 避免用旧状态覆盖新状态（极端时序下 SSE 先推新、fetch 返回旧快照）
+            if (fresh && fresh.board && pushSeq === beforeSeq) {
+              const serverMoves = (fresh.history || []).length;
+              if (serverMoves >= beforeMoves) {
+                state.game = { ...state.game, ...fresh };
+                render().catch(err => console.error('[render] error', err));
+              }
             }
           } catch (_) {}
         }
@@ -1002,6 +1063,8 @@
       const isMyTurn = (state.game.turn === 1 && isHumanBlack) || (state.game.turn === 2 && isHumanWhite);
       if (!isMyTurn) return;
       state._moving = true;
+      // 乐观更新前保存快照：API 失败时回滚棋盘与回合，保证前端与后端一致
+      const snapshot = JSON.parse(JSON.stringify(state.game));
       try {
         const res = await api(`/games/${state.game.id}/move`, { method: 'POST', body: JSON.stringify({ row, col }) });
         // 乐观更新：立即在棋盘上放置棋子并切换回合，不用等 SSE
@@ -1016,7 +1079,10 @@
         render();
       } catch (e) {
         console.error('[makeMove] error', e);
+        // 回滚到快照，移除乐观放置的棋子、恢复回合
+        state.game = snapshot;
         toast('落子失败: ' + e.message, 'error');
+        render();
       } finally {
         state._moving = false;
       }
@@ -1634,9 +1700,10 @@
       if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> 开局中…'; }
       try {
         const res = await api(`/rooms/${state.game.room_id}/start`, { method: 'POST' });
-        // 导航前先彻底清理旧对局的 SSE 与状态，避免旧局(game_over)的延迟推送
+        // 导航前先彻底清理旧对局的 SSE / 心跳 / 状态，避免旧局(game_over)的延迟推送
         // 覆盖新局，确保进入的是全新的一局而非终局棋盘。
         if (state._es) { state._es.close(); state._es = null; }
+        if (state._hb) { clearInterval(state._hb); state._hb = null; }
         state.game = null;
         state.logs = [];
         state.currentRoom = null;
@@ -1657,11 +1724,15 @@
       const hash = location.hash;
       const app = document.getElementById('app');
 
-      // 离开游戏页面时清理 SSE 连接
+      // 离开游戏页面时清理 SSE 连接与心跳定时器（防资源泄漏）
       if (!hash.startsWith('#game')) {
         if (state._es) {
           state._es.close();
           state._es = null;
+        }
+        if (state._hb) {
+          clearInterval(state._hb);
+          state._hb = null;
         }
         // 如果当前不在游戏页面且不在配置页面，清理 game 状态
         if (!hash.startsWith('#config')) {
@@ -1698,6 +1769,10 @@
               state._es.close();
               state._es = null;
             }
+            if (state._hb) {
+              clearInterval(state._hb);
+              state._hb = null;
+            }
             state.game = null;
             state.logs = [];
             state._boardKey = '';
@@ -1733,6 +1808,11 @@
     loadConfigs();
     loadRooms();
     window.addEventListener('hashchange', render);
+    // 页面关闭/刷新前清理 SSE 连接与心跳定时器，避免连接泄漏
+    window.addEventListener('beforeunload', () => {
+      if (state._es) { try { state._es.close(); } catch (_) {} state._es = null; }
+      if (state._hb) { clearInterval(state._hb); state._hb = null; }
+    });
   </script>
 </body>
 </html>
