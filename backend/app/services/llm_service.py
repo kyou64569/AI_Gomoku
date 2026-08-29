@@ -6,7 +6,9 @@ import httpx
 from openai import OpenAI
 from openai import BadRequestError, UnprocessableEntityError, NotFoundError, APITimeoutError, APIConnectionError
 from . import game_logic
-from .game_logic import DIRECTIONS, N, count_line, place_stone, is_valid_move, is_forbidden_move
+from . import metrics
+from .game_logic import (DIRECTIONS, N, count_line, place_stone, is_valid_move, is_forbidden_move,
+                         get_candidate_positions, find_win_line)
 
 # ============ 确定性评分引擎（不依赖 LLM 也能下好棋） ============
 SCORE_WIN = 10_000_000      # 连五
@@ -81,55 +83,131 @@ def score_point(board, row, col, me, enemy):
     return attack, defend
 
 
-def engine_best_move(board, turn, forbidden=False):
-    """纯确定性评分：遍历所有空位，返回 (row, col, total_score, attack, defend, reason)。
+# 中心偏置上限：仅在没有棋型分时起作用（让开局往中心走），不会盖过活二
+CENTER_BIAS_MAX = 60
+
+# 困难难度的 2 层搜索参数：对静态分 top-K 候选，模拟落子后看对手最强应手
+HARD_TOP_K = 10
+HARD_OPPONENT_WEIGHT = 0.85
+
+
+def _center_bias(board, r, c) -> int:
+    n = len(board)
+    center = (n - 1) / 2.0
+    return max(0, CENTER_BIAS_MAX - int((abs(r - center) + abs(c - center)) * (8 if n <= 13 else 8)))
+
+
+def evaluate_point(board, row, col, player):
+    """空位 (row,col) 对 player 的综合价值，口径与 _static_candidates 完全一致
+    （攻 + 防 × DEFEND_WEIGHT + 中心偏置），供复盘评分对比"这一手 vs 最优手"。
+
+    返回 (total, attack, defend)。
+    """
+    attack, defend = score_point(board, row, col, player, 3 - player)
+    return attack + int(defend * DEFEND_WEIGHT) + _center_bias(board, row, col), attack, defend
+
+
+def _static_candidates(board, turn, forbidden=False):
+    """对所有候选空位做静态评分，返回按 total 降序的列表。
+
+    每项为 (row, col, total, attack, defend)。候选点用 get_candidate_positions
+    裁剪（只保留棋子周围 2 格），把 15 路 225 个空位降到几十个，
+    使困难难度的 2 层搜索具备实时性。
+    """
+    me = turn
+    enemy = 3 - turn
+    candidates = get_candidate_positions(board, radius=2)
+    if not candidates:
+        candidates = game_logic.get_empty_positions(board)
+    scored = []
+    for r, c in candidates:
+        if board[r][c] != 0:
+            continue
+        if forbidden and is_forbidden_move(board, r, c, me):
+            continue
+        attack, defend = score_point(board, r, c, me, enemy)
+        total = attack + int(defend * DEFEND_WEIGHT) + _center_bias(board, r, c)
+        scored.append((r, c, total, attack, defend))
+    scored.sort(key=lambda x: (-x[2], x[0], x[1]))
+    return scored
+
+
+def _reason_for(row, col, attack, defend, total) -> str:
+    """把攻防分翻译成人类可读的落子理由（引擎日志 / 前端展示）。"""
+    if attack >= SCORE_WIN:
+        return f"一步连五 ({row},{col})"
+    if defend >= SCORE_WIN:
+        return f"堵对方连五 ({row},{col})"
+    if attack >= SCORE_LIVE_FOUR:
+        return f"形成活四 ({row},{col})"
+    if defend >= SCORE_LIVE_FOUR:
+        return f"堵对方活四 ({row},{col})"
+    if attack >= SCORE_DEAD_FOUR:
+        return f"形成冲四 ({row},{col})"
+    if defend >= SCORE_DEAD_FOUR:
+        return f"堵对方冲四 ({row},{col})"
+    if attack >= SCORE_LIVE_THREE:
+        return f"形成活三 ({row},{col})"
+    if defend >= SCORE_LIVE_THREE:
+        return f"堵对方活三 ({row},{col})"
+    return f"攻{attack}/防{defend}"
+
+
+def engine_top_moves(board, turn, k=3, forbidden=False):
+    """返回引擎评分最高的 k 个候选，用于「AI 在这几个点之间权衡」的思考日志。
+
+    每项为 {"row","col","total","attack","defend","reason"}，按 total 降序。
+    """
+    scored = _static_candidates(board, turn, forbidden=forbidden)
+    return [
+        {
+            "row": r, "col": c, "total": t, "attack": a, "defend": d,
+            "reason": _reason_for(r, c, a, d, t),
+        }
+        for r, c, t, a, d in scored[:max(1, k)]
+    ]
+
+
+def engine_best_move(board, turn, forbidden=False, depth=1):
+    """纯确定性评分：返回 (row, col, total_score, attack, defend, reason)。
 
     优先级天然被权重覆盖：
     - 己方能连五 → 攻分最高（SCORE_WIN）
     - 对方能连五 → 该点防分最高（SCORE_WIN × DEFEND_WEIGHT），必然选它堵
     - 己方活四/对方活四 → 次高分
     - 常规局面 → 攻防总和高者胜出
+
+    depth=2（困难难度）在 top-K 静态候选上再做一层对手应手模拟：
+    落子后让对手走最优一步，用「我的静态收益 − 0.85 × 对手最强应手」排序，
+    能过滤掉"看似得分高、其实送给对手机会"的假好点。
     """
+    scored = _static_candidates(board, turn, forbidden=forbidden)
+    if not scored:
+        return None
+    if depth < 2 or len(scored) == 1:
+        r, c, t, a, d = scored[0]
+        return r, c, t, a, d, _reason_for(r, c, a, d, t)
+
     me = turn
     enemy = 3 - turn
-    center = (N - 1) / 2.0
     best = None
-    for r in range(N):
-        for c in range(N):
-            if board[r][c] != 0:
-                continue
-            if forbidden and is_forbidden_move(board, r, c, me):
-                continue
-            attack, defend = score_point(board, r, c, me, enemy)
-            total = attack + int(defend * DEFEND_WEIGHT)
-            # 中心偏置：空盘/早期无棋型时优先往中心发展（不超过 1 个活二的分值）
-            center_bias = max(0, 60 - int((abs(r - center) + abs(c - center)) * 8))
-            total += center_bias
-            if best is None or total > best[2]:
-                best = (r, c, total, attack, defend, "")
-    if best is None:
-        return None
-    row, col, total, attack, defend, _ = best
-    # 生成人类可读的 reason
-    if attack >= SCORE_WIN:
-        reason = f"一步连五 ({row},{col})"
-    elif defend >= SCORE_WIN:
-        reason = f"堵对方连五 ({row},{col})"
-    elif attack >= SCORE_LIVE_FOUR:
-        reason = f"形成活四 ({row},{col})"
-    elif defend >= SCORE_LIVE_FOUR:
-        reason = f"堵对方活四 ({row},{col})"
-    elif attack >= SCORE_DEAD_FOUR:
-        reason = f"形成冲四 ({row},{col})"
-    elif defend >= SCORE_DEAD_FOUR:
-        reason = f"堵对方冲四 ({row},{col})"
-    elif attack >= SCORE_LIVE_THREE:
-        reason = f"形成活三 ({row},{col})"
-    elif defend >= SCORE_LIVE_THREE:
-        reason = f"堵对方活三 ({row},{col})"
-    else:
-        reason = f"攻{attack}/防{defend}"
-    return row, col, total, attack, defend, reason
+    for r, c, t, a, d in scored[:HARD_TOP_K]:
+        if a >= SCORE_WIN:
+            # 能一步连五，无需再算
+            return r, c, t, a, d, _reason_for(r, c, a, d, t)
+        sim = place_stone(board, r, c, me)
+        if game_logic.check_win(sim, r, c, me):
+            return r, c, SCORE_WIN * 2, SCORE_WIN, d, f"一步连五 ({r},{c})"
+        opp = _static_candidates(sim, enemy, forbidden=False)
+        opp_best = opp[0][2] if opp else 0
+        value = int(t - HARD_OPPONENT_WEIGHT * opp_best)
+        # 对手下一步能连五 → 这手是败着，重罚
+        if opp and opp[0][3] >= SCORE_WIN and a < SCORE_WIN:
+            value -= SCORE_WIN
+        if best is None or value > best[0]:
+            best = (value, r, c, t, a, d)
+    _, r, c, t, a, d = best
+    return r, c, t, a, d, _reason_for(r, c, a, d, t)
 
 
 # ============ 棋型分析（供 prompt 使用，含跳型识别） ============
@@ -195,8 +273,9 @@ def analyze_board(board, player):
         "five": [], "live_four": [], "dead_four": [],
         "live_three": [], "dead_three": [], "live_two": []
     }
-    for r in range(N):
-        for c in range(N):
+    n = len(board)
+    for r in range(n):
+        for c in range(n):
             if board[r][c] != 0:
                 continue
             sim = place_stone(board, r, c, player)
@@ -253,6 +332,9 @@ def get_threats_and_opportunities(board, turn):
 
 
 def build_prompt(board, turn, history, player_name):
+    n = len(board)
+    lo, hi = 0, n - 1
+    mid = n // 2
     board_str = "\n".join([" ".join(["X" if cell == 1 else "O" if cell == 2 else "." for cell in row]) for row in board])
     history_str = "\n".join([f"{'黑' if h['player']==1 else '白'} ({h['player_name']}) 落子 ({h['row']},{h['col']})" for h in history[-5:]])
 
@@ -295,8 +377,8 @@ def build_prompt(board, turn, history, player_name):
 敌方是{enemy_color}（{enemy_stone}）。
 
 【棋盘坐标】
-- 15×15 棋盘，左上角为(0,0)，右下角为(14,14)
-- 行号(row)范围 0-14，列号(col)范围 0-14
+- {n}×{n} 棋盘，左上角为({lo},{lo})，右下角为({hi},{hi})
+- 行号(row)范围 {lo}-{hi}，列号(col)范围 {lo}-{hi}
 
 【当前棋盘状态】
 {board_str}
@@ -316,13 +398,13 @@ def build_prompt(board, turn, history, player_name):
 2. 如果【必须防守】非空，必须选择那里（堵敌方威胁）
 3. 否则，在【你的活四/冲四/活三】中选择最有利的
 4. 否则，在已有棋子附近落子，不要下在孤立位置
-5. 如果没有任何棋子，优先下在中心附近(7,7)
+5. 如果没有任何棋子，优先下在中心附近({mid},{mid})
 
 【输出要求】
 - 思考过程请控制在 150 tokens 以内，直接给出结论，不要长篇分析
 - 只返回一个合法的 JSON 对象，不要输出任何其他文字（不要用 markdown 代码块）
-- 格式如下（row 和 col 必须是 0-14 的整数，且必须是棋盘上的空位）：
-{{"row": 7, "col": 7, "reason": "形成活三，威胁对方"}}
+- 格式如下（row 和 col 必须是 {lo}-{hi} 的整数，且必须是棋盘上的空位）：
+{{"row": {mid}, "col": {mid}, "reason": "形成活三，威胁对方"}}
 """
     return prompt
 
@@ -438,7 +520,80 @@ def _combo_signature(combo: dict) -> tuple:
     return tuple(parts)
 
 
+def chat_json(base_url, api_key, model_id, system_prompt, user_prompt,
+              reasoning_effort="", max_tokens=2048):
+    """通用 JSON 对话（供「AI 复盘点评」这类一次性分析使用）。
+
+    复用与落子相同的参数降级链（response_format / reasoning_effort 兼容性），
+    返回 dict；失败返回 {"_error": "原因"}。
+    """
+    try:
+        client = _get_client(base_url, api_key)
+    except Exception as e:
+        return {"_error": f"客户端创建失败: {e}"}
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    kwargs = dict(model=model_id, messages=messages, temperature=TEMPERATURE, max_tokens=max_tokens)
+    combos = []
+    if reasoning_effort:
+        combos = [
+            {**kwargs, "response_format": {"type": "json_object"}, "reasoning_effort": reasoning_effort},
+            {**kwargs, "reasoning_effort": reasoning_effort},
+        ]
+    combos += [{**kwargs, "response_format": {"type": "json_object"}}, kwargs]
+
+    deadline = time.monotonic() + LLM_CALL_DEADLINE
+    last_exc = None
+    response = None
+    for combo in combos:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            response = client.chat.completions.create(**combo)
+            break
+        except (BadRequestError, UnprocessableEntityError, NotFoundError, TypeError) as e:
+            last_exc = e
+            metrics.record_degraded(base_url, model_id)
+            continue
+        except Exception as e:
+            last_exc = e
+            break
+    if response is None:
+        return {"_error": str(last_exc) if last_exc else "LLM 请求失败"}
+    content = response.choices[0].message.content
+    if not content or not content.strip():
+        return {"_error": "LLM 返回空内容"}
+    start = content.find("{")
+    end = content.rfind("}")
+    if start >= 0 and end > start:
+        content = content[start:end + 1]
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        return {"_error": f"点评 JSON 解析失败: {e}"}
+    return data if isinstance(data, dict) else {"_error": "点评返回不是 JSON 对象"}
+
+
 def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=""):
+    """带可观测性埋点的 LLM 调用入口（内部转发到 _call_llm_raw）。"""
+    started = time.monotonic()
+    try:
+        row, col, err = _call_llm_raw(base_url, api_key, model_id, prompt, temperature, reasoning_effort)
+    except Exception as e:  # 兜底：任何异常都要计入指标，不能让埋点把调用链打断
+        row, col, err = None, None, str(e)
+    latency_ms = int((time.monotonic() - started) * 1000)
+    if row is not None:
+        outcome = "ok"
+    else:
+        kind = metrics.classify_error(err)
+        outcome = kind if kind in ("timeout", "parse_fail") else "timeout"
+    metrics.record_call(base_url, model_id, outcome, latency_ms, error=err if row is None else "")
+    return row, col, err
+
+
+def _call_llm_raw(base_url, api_key, model_id, prompt, temperature, reasoning_effort=""):
     """调用 LLM 返回 (row, col, reason)。任何失败返回 (None, None, err_msg)。
 
     健壮性处理：
@@ -534,6 +689,7 @@ def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=
                 last_exc = e
                 with _combo_cache_lock:
                     _combo_cache[cache_key]["bad"].add(sig)
+                metrics.record_degraded(base_url, model_id)
                 continue
             except Exception as e:
                 # 超时/连接/服务端 5xx：与参数无关，后续组合大概率同样失败，
@@ -594,27 +750,103 @@ def _empty_content_err(response, why):
     return note
 
 
-def ai_move(board, turn, history, model_config, player_name, forbidden=False):
-    """AI 决策主入口：
+# 难度档位
+DIFFICULTY_EASY = "easy"
+DIFFICULTY_NORMAL = "normal"
+DIFFICULTY_HARD = "hard"
+DIFFICULTIES = (DIFFICULTY_EASY, DIFFICULTY_NORMAL, DIFFICULTY_HARD)
 
-    1. 先跑确定性评分引擎（engine_best_move）—— 保证不依赖 LLM 也能下好棋
-    2. 若引擎没有绝对把握（无连五/活四/冲四级威胁），尝试 LLM 增强决策
-    3. LLM 返回的点如果合法且评分不差于引擎候选，采纳 LLM；否则用引擎
+# 简单档："手软"程度——从引擎 top-N 里随机挑，而不是总走最优
+EASY_RANDOM_POOL = 5
+
+
+def _llm_config_of(model_config):
+    return (
+        (model_config or {}).get("base_url") or "",
+        (model_config or {}).get("model_id") or "",
+    )
+
+
+def _easy_choice(board, turn, forbidden, scored, llm_row, llm_col):
+    """简单档落子：能一步连五就赢，否则 LLM 说哪就哪，LLM 不灵就在 top-N 里随机。"""
+    if scored and scored[0][3] >= SCORE_WIN:
+        r, c, t, a, d = scored[0]
+        return r, c, _reason_for(r, c, a, d, t)
+    if llm_row is not None and is_valid_move(board, llm_row, llm_col):
+        if not (forbidden and is_forbidden_move(board, llm_row, llm_col, turn)):
+            return llm_row, llm_col, "LLM 建议"
+    pool = [s for s in scored[:EASY_RANDOM_POOL]] or list(scored)
+    r, c, t, a, d = random.choice(pool)
+    return r, c, _reason_for(r, c, a, d, t)
+
+
+def ai_move(board, turn, history, model_config, player_name, forbidden=False,
+            difficulty=DIFFICULTY_NORMAL):
+    """AI 决策主入口。难度决定"引擎 vs LLM"的分工：
+
+    - easy   简单：能赢就赢，其余听 LLM 的（不做评分门槛），LLM 不灵就在引擎 top-N 随机
+    - normal 普通：引擎先判杀棋（连五/活四），关键手直接落子；其余交给 LLM 增强，
+                   LLM 落点评分不低于引擎候选 60% 才采纳
+    - hard   困难：纯引擎 + 2 层搜索（模拟对手最强应手），完全不依赖 LLM
+
+    返回 (row, col, reason)：reason 会写进 game.logs，前端思考日志面板可见。
     """
     me = turn
     enemy = 3 - turn
     empty = game_logic.get_empty_positions(board)
     if not empty:
         return None, None, "棋盘已满"
+    if difficulty not in DIFFICULTIES:
+        difficulty = DIFFICULTY_NORMAL
 
-    # 1) 确定性引擎
-    engine = engine_best_move(board, turn, forbidden=forbidden)
+    base_url, model_id = _llm_config_of(model_config)
+
+    # 1) 困难档：纯引擎深算，不调 LLM（省配额、低延迟、棋力最强）
+    if difficulty == DIFFICULTY_HARD:
+        engine = engine_best_move(board, turn, forbidden=forbidden, depth=2)
+        if engine is None:
+            r, c = random.choice(empty)
+            return r, c, "引擎无合法点，随机"
+        r, c, t, a, d, reason = engine
+        return r, c, f"引擎(深算): {reason}"
+
+    # 2) 确定性引擎（1 层）
+    engine = engine_best_move(board, turn, forbidden=forbidden, depth=1)
     if engine is None:
         r, c = random.choice(empty)
         return r, c, "引擎无合法点，随机"
     e_row, e_col, e_total, e_attack, e_defend, e_reason = engine
+    scored = _static_candidates(board, turn, forbidden=forbidden)
 
-    # 2) 引擎有绝对把握就直接返回（不问 LLM，快且稳）
+    # 3) 调用 LLM（简单档与普通档都需要它的"风格"）
+    llm_row = llm_col = None
+    llm_reason = ""
+    llm_note = ""
+    if model_config and model_config.get("base_url"):
+        try:
+            prompt = build_prompt(board, turn, history, player_name)
+            llm_row, llm_col, llm_reason = call_llm(
+                model_config["base_url"], model_config["api_key"],
+                model_config["model_id"], prompt, TEMPERATURE,
+                reasoning_effort=model_config.get("reasoning_effort", "")
+            )
+        except Exception as e:
+            llm_note = f"（LLM 异常: {type(e).__name__}: {e}）"
+
+    # 4) 简单档：不做评分门槛，最大化 LLM 的"人味儿"
+    if difficulty == DIFFICULTY_EASY:
+        if llm_row is None and not llm_note:
+            llm_note = f"（LLM 无有效落点: {llm_reason or '无返回'}）"
+        r, c, reason = _easy_choice(board, turn, forbidden, scored, llm_row, llm_col)
+        if llm_row is not None and (r, c) != (llm_row, llm_col):
+            # LLM 给了点但被合法性/禁手过滤掉 → 记为 rejected
+            metrics.record_outcome(base_url, model_id, "rejected")
+            metrics.record_outcome(base_url, model_id, "fallback")
+        if len(llm_note) > 120:
+            llm_note = llm_note[:117] + "…"
+        return r, c, f"{reason}{llm_note}"
+
+    # 5) 普通档：引擎有绝对把握就直接返回（不问 LLM，快且稳）
     decisive = (
         e_attack >= SCORE_WIN            # 己方连五
         or e_defend >= SCORE_WIN         # 对方连五必须堵
@@ -624,37 +856,29 @@ def ai_move(board, turn, history, model_config, player_name, forbidden=False):
     if decisive:
         return e_row, e_col, f"引擎: {e_reason}"
 
-    # 3) 常规局面 → LLM 增强（可选，失败不影响；失败原因透传进 reason 便于日志诊断）
-    llm_note = ""
-    if model_config and model_config.get("base_url"):
-        try:
-            prompt = build_prompt(board, turn, history, player_name)
-            row, col, llm_reason = call_llm(
-                model_config["base_url"], model_config["api_key"],
-                model_config["model_id"], prompt, TEMPERATURE,
-                reasoning_effort=model_config.get("reasoning_effort", "")
-            )
-            if row is None:
-                llm_note = f"（LLM 调用失败: {llm_reason or '无返回'}）"
-            elif not is_valid_move(board, row, col):
-                llm_note = f"（LLM 返回非法坐标 ({row},{col})）"
-            elif forbidden and is_forbidden_move(board, row, col, turn):
-                llm_note = f"（LLM 落点为禁手 ({row},{col})）"
-            else:
-                # 校验 LLM 落点评分：不低于引擎候选的 60% 才采纳
-                # 60% 阈值理由：允许 LLM 在非关键局面（无连五/活四/冲四）进行风格化决策，
-                # 同时防止 LLM 选择明显劣着（如完全放弃防守、孤立落子）。
-                # 引擎评分基于棋型权重（连五=1000万、活四=100万等），60% 足以过滤掉
-                # 纯随机或明显错误的落子，同时保留 LLM 的策略多样性。
-                llm_attack, llm_defend = score_point(board, row, col, me, enemy)
-                llm_total = llm_attack + int(llm_defend * DEFEND_WEIGHT)
-                if llm_total >= e_total * 0.6:
-                    return row, col, f"LLM: {llm_reason or '策略落子'}"
-                llm_note = f"（LLM 评分不足: {llm_total} < 引擎 {int(e_total * 0.6)}）"
-        except Exception as e:
-            llm_note = f"（LLM 异常: {type(e).__name__}: {e}）"
+    if llm_row is not None:
+        if not is_valid_move(board, llm_row, llm_col):
+            llm_note = f"（LLM 返回非法坐标 ({llm_row},{llm_col})）"
+            metrics.record_outcome(base_url, model_id, "rejected")
+        elif forbidden and is_forbidden_move(board, llm_row, llm_col, turn):
+            llm_note = f"（LLM 落点为禁手 ({llm_row},{llm_col})）"
+            metrics.record_outcome(base_url, model_id, "rejected")
+        else:
+            # 校验 LLM 落点评分：不低于引擎候选的 60% 才采纳
+            # 60% 阈值理由：允许 LLM 在非关键局面（无连五/活四/冲四）进行风格化决策，
+            # 同时防止 LLM 选择明显劣着（如完全放弃防守、孤立落子）。
+            llm_attack, llm_defend = score_point(board, llm_row, llm_col, me, enemy)
+            llm_total = llm_attack + int(llm_defend * DEFEND_WEIGHT)
+            if llm_total >= e_total * 0.6:
+                # top-N 权衡说明由 room_service._deliberation_log 统一附加，此处只给结论
+                return llm_row, llm_col, f"LLM: {llm_reason or '策略落子'}"
+            llm_note = f"（LLM 评分不足: {llm_total} < 引擎 {int(e_total * 0.6)}）"
+            metrics.record_outcome(base_url, model_id, "rejected")
+    elif not llm_note:
+        llm_note = f"（LLM 调用失败: {llm_reason or '无返回'}）"
 
-    # 4) 引擎兜底（附加 LLM 诊断信息，截断过长错误）
+    # 6) 引擎兜底（附加 LLM 诊断信息，截断过长错误）
+    metrics.record_outcome(base_url, model_id, "fallback")
     if len(llm_note) > 120:
         llm_note = llm_note[:117] + "…"
     return e_row, e_col, f"引擎: {e_reason}{llm_note}"

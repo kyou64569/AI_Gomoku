@@ -9,7 +9,8 @@ import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
-from .routers import configs_router, players_router, rooms_router, game_router, history_router
+from .routers import (configs_router, players_router, rooms_router, game_router,
+                      history_router, arena_router, stats_router)
 from .models import Base
 from .database import engine
 
@@ -59,6 +60,45 @@ def _migrate_schema():
                 conn.execute(text("UPDATE games SET created_at = :now WHERE created_at IS NULL"), {"now": now_utc})
                 conn.commit()
                 logger.info("[migrate] games.created_at 列已添加（现有记录已更新）")
+
+            # ---- 规则选项 / 中途操作：rooms.options + games 多个可选列 ----
+            # SECURITY NOTE: Table names and column names are hardcoded here to prevent SQL injection
+            if "options" not in [row[1] for row in conn.execute(text("PRAGMA table_info(rooms)"))]:
+                conn.execute(text("ALTER TABLE rooms ADD COLUMN options TEXT DEFAULT '{}'"))
+                conn.commit()
+                logger.info("[migrate] rooms.options 列已添加")
+
+            gcols = [row[1] for row in conn.execute(text("PRAGMA table_info(games)"))]
+            _game_new_cols = (
+                ("size", "INTEGER DEFAULT 15"),
+                ("forbidden", "INTEGER DEFAULT 0"),
+                ("difficulty", "VARCHAR(20) DEFAULT 'normal'"),
+                ("first", "INTEGER DEFAULT 1"),
+                ("pending_draw", "INTEGER DEFAULT 0"),
+                ("pending_swap", "INTEGER DEFAULT 0"),
+                ("swap", "INTEGER DEFAULT 0"),
+                ("ended_reason", "VARCHAR(40) DEFAULT ''"),
+                ("review", "TEXT DEFAULT ''"),
+            )
+            for col, ddl in _game_new_cols:
+                if col not in gcols:
+                    conn.execute(text(f"ALTER TABLE games ADD COLUMN {col} {ddl}"))
+                    conn.commit()
+                    logger.info(f"[migrate] games.{col} 列已添加")
+
+            # 自愈：清理指向已删除对局的擂台赛单局记录（房间被删后 Game 行会一起消失）。
+            # 历史遗留的悬空行会让棋力排行榜把早已删除的对局继续算进战绩。
+            # SECURITY NOTE: SQL 使用硬编码表名/列名，无外部输入拼接
+            tables = {row[0] for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'"))}
+            if "arena_games" in tables:
+                cur = conn.execute(text(
+                    "DELETE FROM arena_games WHERE game_id IS NOT NULL "
+                    "AND game_id NOT IN (SELECT id FROM games)"
+                ))
+                if cur.rowcount:
+                    conn.commit()
+                    logger.info("[migrate] 已清理 %s 条悬空的擂台赛单局记录", cur.rowcount)
         except Exception as e:
             logger.error(f"[migrate] 列迁移失败: {e}", exc_info=True)
             # For critical migration failures, consider raising the exception
@@ -103,6 +143,8 @@ app.include_router(players_router)
 app.include_router(rooms_router)
 app.include_router(game_router)
 app.include_router(history_router)
+app.include_router(arena_router)
+app.include_router(stats_router)
 
 # 前端静态目录：基于 __file__ 的绝对路径，不依赖启动 CWD
 FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"

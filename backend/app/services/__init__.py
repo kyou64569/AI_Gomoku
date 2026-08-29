@@ -1,8 +1,11 @@
 import json
+import logging
 import random
 from datetime import datetime
 from sqlalchemy.orm import Session
 from ..models import ModelConfig, AIPlayer, Room, Game
+
+logger = logging.getLogger(__name__)
 
 
 def get_model_config(db: Session, config_id: int):
@@ -47,8 +50,19 @@ def list_ai_players(db: Session):
 
 
 def delete_ai_player(db: Session, player_id: int):
+    """删除 AI 玩家。
+
+    该玩家若参加过擂台赛（arena_runs.player_a_id/b_id 外键，且库里开了
+    PRAGMA foreign_keys=ON），直接删会抛 IntegrityError → 前端只能看到 500。
+    这里先级联清理他参与的擂台赛（含单局记录与底层对局/房间），再删玩家。
+    """
     player = db.query(AIPlayer).filter(AIPlayer.id == player_id).first()
     if player:
+        # 延迟导入避免 services 包与 arena_service 形成循环依赖
+        from .arena_service import delete_runs_for_player
+        success_count, failure_count = delete_runs_for_player(db, player_id)
+        if failure_count > 0:
+            logger.warning("删除玩家 %s 时有 %s 个擂台赛删除失败", player_id, failure_count)
         db.delete(player)
         db.commit()
     return player

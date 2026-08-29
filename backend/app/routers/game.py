@@ -6,8 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from ..database import get_db, SessionLocal
-from ..services.room_service import get_game, handle_move, ai_turn, get_room, cleanup_move_lock
+from ..services.room_service import (
+    get_game, handle_move, ai_turn, get_room, cleanup_move_lock,
+    undo_moves, resign_game, offer_draw, respond_draw, ai_draw_decision,
+    game_options, _load_history, resolve_swap,
+)
 from ..services.config_helper import resolve_api_key
+from ..services.analysis_service import analyze_game, review_game
 from ..models import Game, AIPlayer, ModelConfig, Room
 
 router = APIRouter(prefix="/api/games", tags=["games"])
@@ -66,7 +71,10 @@ def get_seat_by_role(db, game_id, role):
     room = get_room(db, game.room_id)
     if not room:
         return None
-    seats = json.loads(room.seats)
+    try:
+        seats = json.loads(room.seats)
+    except (json.JSONDecodeError, TypeError):
+        return None
     return next((s for s in seats if s.get("role") == role), None)
 
 
@@ -79,6 +87,12 @@ def is_human_turn(db, game_id, turn):
     return player_id is None or player_id == 0 or player_id == "human"
 
 
+def seat_player_id(db, game_id, turn):
+    """当前回合方的座位 player_id（AI 为具体 id，人类为 None）。"""
+    seat = get_seat_by_role(db, game_id, "black" if turn == 1 else "white")
+    return seat.get("player_id") if seat else None
+
+
 def trigger_ai_if_needed(game_id, db):
     global ai_move_locks
     if not acquire_ai_lock(game_id):
@@ -88,7 +102,7 @@ def trigger_ai_if_needed(game_id, db):
     def release_lock():
         with ai_move_locks_lock:
             ai_move_locks.pop(game_id, None)
-    
+
     try:
         # 刷新缓存：SSE 长连接的 session 可能持有旧 identity map，
         # 用户刚改的 AIPlayer / ModelConfig 配置需要重新查询才能拿到最新值。
@@ -126,8 +140,10 @@ def trigger_ai_if_needed(game_id, db):
             print(f"[AI] game={game_id} skipped: config {player.model_config_id} not found")
             release_lock()
             return
-        
-        print(f"[AI] game={game_id} starting AI move: player={player.name}, model={player.model_id}, turn={game.turn}")
+
+        opts = game_options(game)
+        print(f"[AI] game={game_id} starting AI move: player={player.name}, model={player.model_id}, "
+              f"turn={game.turn}, difficulty={opts['difficulty']}, forbidden={opts['forbidden']}")
         model_config = {
             "base_url": config.base_url,
             "api_key": resolve_api_key(config),
@@ -144,8 +160,11 @@ def trigger_ai_if_needed(game_id, db):
                 if not game_check or game_check.status != "playing":
                     print(f"[AI] game={game_id} skipped: game not playing in thread (status={game_check.status if game_check else 'None'})")
                     return
+                local_opts = game_options(game_check)
                 result = ai_turn(db_local, game_id, model_config, player.name,
-                                 expected_player_id=player_id, forbidden=True)
+                                 expected_player_id=player_id,
+                                 forbidden=bool(local_opts["forbidden"]),
+                                 difficulty=local_opts["difficulty"])
                 print(f"[AI] game={game_id} move completed: {result}")
             except Exception as e:
                 print(f"[AI] game={game_id} error: {e}")
@@ -170,19 +189,11 @@ def trigger_ai_if_needed(game_id, db):
         release_lock()
 
 
-@router.get("/{game_id}/state")
-def get_state(game_id: int, db: Session = Depends(get_db)):
-    game = get_game(db, game_id)
-    if not game:
-        raise HTTPException(status_code=404, detail="对局不存在")
+def state_payload(db, game):
     try:
         board = json.loads(game.board)
     except json.JSONDecodeError:
-        board = [[0]*15 for _ in range(15)]
-    try:
-        history = json.loads(game.history)
-    except json.JSONDecodeError:
-        history = []
+        board = [[0] * int(game.size or 15) for _ in range(int(game.size or 15))]
     try:
         logs = json.loads(game.logs)
     except json.JSONDecodeError:
@@ -191,40 +202,245 @@ def get_state(game_id: int, db: Session = Depends(get_db)):
         scores = json.loads(game.scores)
     except json.JSONDecodeError:
         scores = {"black": 0, "white": 0}
+    room = db.query(Room).filter(Room.id == game.room_id).first() if db else None
     return {
         "id": game.id,
         "room_id": game.room_id,
         "board": board,
         "turn": game.turn,
-        "history": history,
+        "history": _load_history(game),
         "winner": game.winner,
         "logs": logs,
         "status": game.status,
-        "scores": scores
+        "scores": scores,
+        # 规则与中途操作（前端据此渲染禁手/难度/悔棋/求和等 UI）
+        "size": int(getattr(game, "size", 15) or 15),
+        "forbidden": int(getattr(game, "forbidden", 0) or 0),
+        "difficulty": getattr(game, "difficulty", "normal") or "normal",
+        "first": int(getattr(game, "first", 1) or 1),
+        "pending_draw": int(getattr(game, "pending_draw", 0) or 0),
+        "pending_swap": int(getattr(game, "pending_swap", 0) or 0),
+        "swap": int(getattr(game, "swap", 0) or 0),
+        "ended_reason": getattr(game, "ended_reason", "") or "",
+        "mode": room.mode if room else "pve",
+        "seats": (json.loads(room.seats) if room and room.seats else []),
+        "has_review": bool(getattr(game, "review", "")),
     }
+
+
+@router.get("/{game_id}/state")
+def get_state(game_id: int, db: Session = Depends(get_db)):
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    return state_payload(db, game)
+
+
+def _auto_swap_decision(board) -> bool:
+    """三手交换里 AI 的裁决：黑方那 3 手的棋型价值明显高于自己就抢过来。"""
+    try:
+        from ..services.llm_service import _static_candidates
+        black = _static_candidates(board, 1)
+        white = _static_candidates(board, 2)
+    except Exception:
+        return False
+    if not black or not white:
+        return False
+    return black[0][2] > white[0][2] * 1.1
 
 
 @router.post("/{game_id}/move")
 def make_move(game_id: int, row: int = Body(...), col: int = Body(...), db: Session = Depends(get_db)):
-    # 输入验证：坐标必须在 0-14 范围内
-    if not (0 <= row <= 14 and 0 <= col <= 14):
-        raise HTTPException(status_code=400, detail="坐标超出范围（0-14）")
-    
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    size = int(getattr(game, "size", 15) or 15)
+    # 输入验证：坐标必须落在本局棋盘范围内（9/13/15 路自适应）
+    if not (0 <= row < size and 0 <= col < size):
+        raise HTTPException(status_code=400, detail=f"坐标超出范围（0-{size - 1}）")
+    if game.status != "playing":
+        raise HTTPException(status_code=400, detail="对局未在进行中")
+    if getattr(game, "pending_swap", 0):
+        raise HTTPException(status_code=400, detail="请先完成三手交换的选择")
+    if not is_human_turn(db, game_id, game.turn):
+        role = "黑方" if game.turn == 1 else "白方"
+        raise HTTPException(status_code=400, detail=f"当前是{role}回合，请等待")
+    opts = game_options(game)
+    result = handle_move(db, game_id, game.turn, row, col, "Player",
+                         expected_player_id="human", forbidden=bool(opts["forbidden"]))
+    if not result:
+        raise HTTPException(status_code=400, detail="非法落子（可能位置已被占用或命中禁手）")
+
+    # 三手交换：第 3 手落下后需要裁决。决策方是白方——若白方是 AI 就用引擎即时判定，
+    # 是真人则把 pending_swap 交给前端弹选择。未裁决前不能触发 AI 落子。
+    if result.status == "playing" and getattr(result, "pending_swap", 0):
+        if is_human_turn(db, game_id, 2):
+            return {"status": "ok", "pending_swap": True}
+        try:
+            board = json.loads(result.board)
+        except json.JSONDecodeError:
+            board = [[0] * size for _ in range(size)]
+        accept = _auto_swap_decision(board)
+        logs = json.loads(result.logs or "[]")
+        logs.append(f"三手交换：白方（AI）{'选择交换' if accept else '选择不交换'}")
+        result.logs = json.dumps(logs[-500:])
+        db.commit()
+        resolve_swap(db, game_id, accept)
+        db.refresh(result)
+
+    if result.status == "playing":
+        trigger_ai_if_needed(game_id, db)
+    return {"status": "ok", "pending_swap": bool(getattr(result, "pending_swap", 0))}
+
+
+# ============ 中途操作：悔棋 / 认输 / 求和 ============
+@router.post("/{game_id}/undo")
+def undo(game_id: int, count: int = Body(1, embed=True), db: Session = Depends(get_db)):
+    """悔棋。人机默认退 2 手（AI 应手 + 自己那手），真人对战退 1 手。"""
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    room = db.query(Room).filter(Room.id == game.room_id).first()
+    if room and room.mode == "watch":
+        raise HTTPException(status_code=400, detail="观战模式不支持悔棋")
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        count = 1
+    result = undo_moves(db, game_id, count)
+    if not result:
+        raise HTTPException(status_code=400, detail="没有可悔的棋步")
+    return {"status": "ok", "game": state_payload(db, result)}
+
+
+@router.post("/{game_id}/resign")
+def resign(game_id: int, player: int = Body(..., embed=True), db: Session = Depends(get_db)):
+    """认输：player(1=黑/2=白) 判负。人机模式下玩家只能认输自己那一方。"""
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    if player not in (1, 2):
+        raise HTTPException(status_code=400, detail="player 必须是 1(黑) 或 2(白)")
+    if not is_human_turn(db, game_id, player):
+        raise HTTPException(status_code=400, detail="只能替己方认输")
+    result = resign_game(db, game_id, player)
+    if not result:
+        raise HTTPException(status_code=400, detail="认输失败（对局可能已结束）")
+    return {"status": "ok", "game": state_payload(db, result)}
+
+
+@router.post("/{game_id}/draw/offer")
+def draw_offer(game_id: int, player: int = Body(..., embed=True), db: Session = Depends(get_db)):
+    """提出求和。对手是 AI 时立即用引擎裁决，是真人时等待对方回应。"""
     game = get_game(db, game_id)
     if not game:
         raise HTTPException(status_code=404, detail="对局不存在")
     if game.status != "playing":
         raise HTTPException(status_code=400, detail="对局未在进行中")
-    if not is_human_turn(db, game_id, game.turn):
-        role = "黑方" if game.turn == 1 else "白方"
-        raise HTTPException(status_code=400, detail=f"当前是{role}回合，请等待")
-    result = handle_move(db, game_id, game.turn, row, col, "Player",
-                         expected_player_id="human", forbidden=True)
+    if player not in (1, 2):
+        raise HTTPException(status_code=400, detail="player 必须是 1(黑) 或 2(白)")
+    if not is_human_turn(db, game_id, player):
+        raise HTTPException(status_code=400, detail="只能由己方提出求和")
+
+    updated, resolved = offer_draw(db, game_id, player)
+    if not updated:
+        raise HTTPException(status_code=400, detail="求和失败")
+
+    # 对手是 AI → 立即裁决（引擎判断 AI 是否占优）
+    opponent = 3 - player
+    if not is_human_turn(db, game_id, opponent):
+        try:
+            board = json.loads(updated.board)
+        except json.JSONDecodeError:
+            board = [[0] * int(updated.size or 15) for _ in range(int(updated.size or 15))]
+        accept = ai_draw_decision(board, opponent)
+        decide_text = "接受" if accept else "拒绝"
+        logs = json.loads(updated.logs or "[]")
+        logs.append(f"{'黑方' if opponent == 1 else '白方'}（AI）{decide_text}求和")
+        updated.logs = json.dumps(logs[-500:])
+        db.commit()
+        if accept:
+            updated.status = "draw"
+            updated.winner = 0
+            updated.ended_reason = "agreement"
+        updated.pending_draw = 0
+        db.commit()
+        db.refresh(updated)
+        return {"status": "ok", "resolved": True, "accepted": accept, "game": state_payload(db, updated)}
+
+    return {"status": "ok", "resolved": False, "game": state_payload(db, updated)}
+
+
+@router.post("/{game_id}/draw/respond")
+def draw_respond(game_id: int, player: int = Body(..., embed=True),
+                 accept: bool = Body(..., embed=True), db: Session = Depends(get_db)):
+    """回应求和。"""
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    if player not in (1, 2):
+        raise HTTPException(status_code=400, detail="player 必须是 1(黑) 或 2(白)")
+    result = respond_draw(db, game_id, player, accept)
     if not result:
-        raise HTTPException(status_code=400, detail="非法落子（可能位置已被占用）")
-    if result.status == "playing":
-        trigger_ai_if_needed(game_id, db)
-    return {"status": "ok"}
+        raise HTTPException(status_code=400, detail="没有待处理的求和")
+    return {"status": "ok", "game": state_payload(db, result)}
+
+
+@router.post("/{game_id}/swap")
+def swap(game_id: int, accept: bool = Body(..., embed=True), db: Session = Depends(get_db)):
+    """三手交换裁决：白方在第 3 手后决定是否接过黑棋。"""
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    room = db.query(Room).filter(Room.id == game.room_id).first()
+    if room and room.mode == "watch":
+        raise HTTPException(status_code=400, detail="观战模式不支持三手交换")
+    result = resolve_swap(db, game_id, accept)
+    if not result:
+        raise HTTPException(status_code=400, detail="当前没有待处理的三手交换")
+    return {"status": "ok", "swapped": bool(accept), "game": state_payload(db, result)}
+
+
+# ============ 复盘：棋力评估报告 + AI 点评 ============
+@router.get("/{game_id}/analysis")
+def get_analysis(game_id: int, db: Session = Depends(get_db)):
+    """逐手引擎评分：失误分级 + 水平报告（纯本地计算，不调 LLM）。"""
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    result = analyze_game(db, game_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    return result
+
+
+@router.post("/{game_id}/review")
+def create_review(game_id: int, force: bool = Body(False, embed=True), db: Session = Depends(get_db)):
+    """AI 点评复盘（调用一次 LLM，结果缓存在 games.review）。"""
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    if game.status not in ("finished", "draw"):
+        raise HTTPException(status_code=400, detail="对局尚未结束，无法点评")
+    result = review_game(db, game_id, force=force)
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=502, detail=result.get("detail", "点评生成失败"))
+    return result
+
+
+@router.get("/{game_id}/review")
+def get_review(game_id: int, db: Session = Depends(get_db)):
+    """读取已缓存的 AI 点评（不触发 LLM 调用）。"""
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    raw = getattr(game, "review", "") or ""
+    if not raw:
+        return {"status": "empty", "review": None}
+    try:
+        return {"status": "ok", "review": json.loads(raw), "cached": True}
+    except (json.JSONDecodeError, TypeError):
+        return {"status": "empty", "review": None}
 
 
 @router.get("/{game_id}/stream")
@@ -233,6 +449,7 @@ def stream_game(game_id: int, request: Request):
         last_board = None
         last_status = None
         last_ai_pending = None  # 新增：跟踪上一次推送的 AI 思考状态
+        last_logs_len = -1      # 悔棋/认输/求和只改日志不改棋盘，需要单独比对
 
         def get_ai_pending() -> bool:
             """AI 是否仍在后台线程里跑（已触发但还没落完）。"""
@@ -266,9 +483,11 @@ def stream_game(game_id: int, request: Request):
 
                     ai_pending = False
                     # 人机模式和观战模式：如果轮到 AI，自动触发 AI 落子
+                    # （pvp 真人对战不走这里：两边都是人，没有 AI 可触发）
                     if status == "playing":
                         room = sse_db.query(Room).filter(Room.id == game.room_id).first()
-                        if room and room.mode in ("pve", "watch"):
+                        # 三手交换待裁决时不能触发 AI：先让决策方把选择做完
+                        if room and room.mode in ("pve", "watch") and not getattr(game, "pending_swap", 0):
                             if not is_human_turn(sse_db, game_id, game.turn):
                                 if not get_ai_pending():
                                     print(f"[SSE] game={game_id} triggering AI, turn={game.turn}")
@@ -282,7 +501,13 @@ def stream_game(game_id: int, request: Request):
                         # 重新查询 ai_pending：触发后到下一次循环才刷新时，可能还在算
                         ai_pending = get_ai_pending()
 
-                    if board != last_board or status != last_status or ai_pending != last_ai_pending:
+                    changed = (
+                        board != last_board
+                        or status != last_status
+                        or ai_pending != last_ai_pending
+                        or len(logs) != last_logs_len
+                    )
+                    if changed:
                         print(f"[SSE] game={game_id} sending update: stones={sum(1 for r in board for c in r if c!=0)}, turn={game.turn}, status={status}, ai_pending={ai_pending}")
                         payload = json.dumps({
                             "board": board,
@@ -291,16 +516,21 @@ def stream_game(game_id: int, request: Request):
                             "winner": winner,
                             "logs": logs[-10:],
                             "ai_pending": ai_pending,  # 新增：前端可显示「AI 思考中」
+                            "size": int(getattr(game, "size", 15) or 15),
+                            "pending_draw": int(getattr(game, "pending_draw", 0) or 0),
+                            "pending_swap": int(getattr(game, "pending_swap", 0) or 0),
+                            "ended_reason": getattr(game, "ended_reason", "") or "",
                         })
                         yield f"event: game_update\ndata: {payload}\n\n"
                         last_board = board
                         last_status = status
                         last_ai_pending = ai_pending
+                        last_logs_len = len(logs)
                     else:
                         print(f"[SSE] game={game_id} no change, skipping update (ai_pending={ai_pending})")
 
                     if status in ["finished", "draw"]:
-                        yield f"event: game_over\ndata: {json.dumps({'winner': winner, 'status': status})}\n\n"
+                        yield f"event: game_over\ndata: {json.dumps({'winner': winner, 'status': status, 'ended_reason': getattr(game, 'ended_reason', '')})}\n\n"
                         cleanup_ai_move_lock(game_id)
                         break
 

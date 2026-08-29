@@ -1,15 +1,28 @@
 from typing import List, Tuple
 
 DIRECTIONS = [(0, 1), (1, 0), (1, 1), (1, -1)]
+
+# 默认棋盘规格（15 路）。棋盘逻辑本身不再硬编码尺寸：
+# 所有函数都从传入的 board 推导 size = len(board)，因此 9/13/15 路共用同一套实现。
+# 这里保留 N 仅作为 create_board() 的默认值与历史调用兼容。
 N = 15
 
+# 允许的可选棋盘规格（前端房间创建下拉用）
+BOARD_SIZES = (9, 13, 15)
 
-def create_board() -> List[List[int]]:
-    return [[0 for _ in range(N)] for _ in range(N)]
+
+def board_size(board: List[List[int]]) -> int:
+    """从棋盘推导尺寸（行数）。空棋盘视为 0，调用方需自行保证非空。"""
+    return len(board) if board else 0
+
+
+def create_board(size: int = N) -> List[List[int]]:
+    return [[0 for _ in range(size)] for _ in range(size)]
 
 
 def is_valid_move(board: List[List[int]], row: int, col: int) -> bool:
-    return 0 <= row < N and 0 <= col < N and board[row][col] == 0
+    n = len(board)
+    return 0 <= row < n and 0 <= col < n and board[row][col] == 0
 
 
 def place_stone(board: List[List[int]], row: int, col: int, player: int) -> List[List[int]]:
@@ -20,11 +33,12 @@ def place_stone(board: List[List[int]], row: int, col: int, player: int) -> List
 
 def check_win(board: List[List[int]], row: int, col: int, player: int) -> bool:
     """自由规则胜负判定：任意方向连 5 子即胜（含长连）。"""
+    n = len(board)
     for dr, dc in DIRECTIONS:
         count = 1
         for d in [1, -1]:
             r, c = row + dr * d, col + dc * d
-            while 0 <= r < N and 0 <= c < N and board[r][c] == player:
+            while 0 <= r < n and 0 <= c < n and board[r][c] == player:
                 count += 1
                 r += dr * d
                 c += dc * d
@@ -34,7 +48,34 @@ def check_win(board: List[List[int]], row: int, col: int, player: int) -> bool:
 
 
 def get_empty_positions(board: List[List[int]]) -> List[Tuple[int, int]]:
-    return [(r, c) for r in range(N) for c in range(N) if board[r][c] == 0]
+    return [(r, c) for r in range(len(board)) for c in range(len(board)) if board[r][c] == 0]
+
+
+def get_candidate_positions(board: List[List[int]], radius: int = 2) -> List[Tuple[int, int]]:
+    """只返回"已有棋子周围 radius 格内"的空位，用于加速搜索。
+
+    远离战场的空位在评分体系里得分恒为 0（除中心偏置外），跳过它们不影响决策质量，
+    却能把 15 路的候选点从 225 降到几十个，让 2 层搜索（困难难度）具备实时性。
+    """
+    n = len(board)
+    has_stone = any(cell != 0 for row in board for cell in row)
+    if not has_stone:
+        mid = n // 2
+        return [(mid, mid)]
+    marked = [[False] * n for _ in range(n)]
+    for r in range(n):
+        for c in range(n):
+            if board[r][c] == 0:
+                continue
+            for dr in range(-radius, radius + 1):
+                rr = r + dr
+                if rr < 0 or rr >= n:
+                    continue
+                for dc in range(-radius, radius + 1):
+                    cc = c + dc
+                    if 0 <= cc < n:
+                        marked[rr][cc] = True
+    return [(r, c) for r in range(n) for c in range(n) if board[r][c] == 0 and marked[r][c]]
 
 
 def count_line(board: List[List[int]], row: int, col: int, player: int, dr: int, dc: int) -> Tuple[int, int]:
@@ -44,15 +85,16 @@ def count_line(board: List[List[int]], row: int, col: int, player: int, dr: int,
     - length: 以 (row,col) 为中心向两侧延伸的连续同色子数（含自身）
     - open_ends: 两端开放数（0/1/2），-1 越界或异色视为封闭
     """
+    n = len(board)
     length = 1
     open_ends = 0
     for d in [1, -1]:
         r, c = row + dr * d, col + dc * d
-        while 0 <= r < N and 0 <= c < N and board[r][c] == player:
+        while 0 <= r < n and 0 <= c < n and board[r][c] == player:
             length += 1
             r += dr * d
             c += dc * d
-        if 0 <= r < N and 0 <= c < N and board[r][c] == 0:
+        if 0 <= r < n and 0 <= c < n and board[r][c] == 0:
             open_ends += 1
     return length, open_ends
 
@@ -93,3 +135,23 @@ def is_forbidden_move(board: List[List[int]], row: int, col: int, player: int) -
     if fours >= 2:
         return True
     return False
+
+
+def find_win_line(board: List[List[int]], player: int) -> List[Tuple[int, int]]:
+    """返回 player 的获胜五连坐标（用于前端高亮 / 复盘展示），无则返回 None。"""
+    n = len(board)
+    for r in range(n):
+        for c in range(n):
+            if board[r][c] != player:
+                continue
+            for dr, dc in DIRECTIONS:
+                cells = [(r, c)]
+                for k in (1, 2, 3, 4):
+                    nr, nc = r + dr * k, c + dc * k
+                    if 0 <= nr < n and 0 <= nc < n and board[nr][nc] == player:
+                        cells.append((nr, nc))
+                    else:
+                        break
+                if len(cells) == 5:
+                    return cells
+    return None
