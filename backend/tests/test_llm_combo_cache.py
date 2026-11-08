@@ -94,3 +94,91 @@ def test_ai_lock_ttl_exceeds_deadline():
     """Fix B 不变量：锁 TTL 必须大于单次 AI 落子最坏耗时，避免慢思考途中过期触发重复线程。"""
     ai_lock_ttl = pytest.importorskip("app.routers.game", reason="game 路由模块缺失").AI_LOCK_TTL
     assert ai_lock_ttl > llm_service.LLM_CALL_DEADLINE
+
+
+# ============ 思考方言（thinking_profile）接入后的组合行为 ============
+
+def test_openai_native_high_sends_dialect_shape_and_budget():
+    """openai-native 高档：首个组合应带 enable_thinking:true + reasoning_effort + 档位预算 24576。"""
+    calls = []
+    with patch.object(llm_service, "OpenAI", _client_factory(calls)):
+        # base_url/api_key 需与本文件其他用例错开：_clients 客户端缓存跨用例共享（只清 _combo_cache），
+        # 撞键会拿到上一个用例的 fake 客户端 → 本用例的 calls 列表为空
+        r, c, _ = llm_service.call_llm("http://eff", "k-eff", "m-eff", "p", 0.2,
+                                       reasoning_effort="high", thinking_profile="openai-native")
+        assert (r, c) == (7, 7)
+        first = calls[0]
+        assert first["enable_thinking"] is True
+        assert first["reasoning_effort"] == "high"
+        assert first["max_tokens"] == 24576  # 思考档预算下限生效（原 1024）
+
+
+def test_nvidia_off_degrades_when_thinking_field_rejected():
+    """nvidia 布尔方言 off：思考字段被端点拒绝（400）时逐级降级，最终不带思考字段成功。"""
+    calls = []
+
+    class _StrictCompletions(_FakeCompletions):
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            # 模拟严格网关：response_format / reasoning_effort / thinking 字段都会被拒
+            if kwargs.get("response_format") or kwargs.get("reasoning_effort") or "thinking" in kwargs:
+                _resp = SimpleNamespace(
+                    status_code=400, headers={},
+                    request=SimpleNamespace(method="POST", url="http://fake"),
+                )
+                raise BadRequestError("param rejected", response=_resp, body=None)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason="stop",
+                                         message=SimpleNamespace(content='{"row": 7, "col": 7, "reason": "ok"}'))]
+            )
+
+    class _StrictClient:
+        def __init__(self, *a, **k):
+            self.chat = SimpleNamespace(completions=_StrictCompletions(calls))
+
+    with patch.object(llm_service, "OpenAI", lambda *a, **k: _StrictClient()):
+        r, c, _ = llm_service.call_llm("http://nv", "k", "m-nv", "p", 0.2,
+                                       reasoning_effort="off", thinking_profile="nvidia")
+        assert (r, c) == (7, 7)
+        # 首个组合按 nvidia 方言发布尔禁用字段；被拒后降级，最终成功组合不含任何思考字段
+        assert calls[0].get("thinking") is False
+        assert "thinking" not in calls[-1]
+        assert len(calls) >= 2
+
+
+def test_combo_cache_key_distinguishes_profiles():
+    """不同 thinking_profile 的组合缓存互不串用：nvidia(off) 的 good 组合不能被 openai-native(off) 复用。"""
+    calls = []
+
+    class _ProfileStrictCompletions(_FakeCompletions):
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if kwargs.get("response_format") or kwargs.get("reasoning_effort") or "thinking" in kwargs:
+                _resp = SimpleNamespace(
+                    status_code=400, headers={},
+                    request=SimpleNamespace(method="POST", url="http://fake"),
+                )
+                raise BadRequestError("param rejected", response=_resp, body=None)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason="stop",
+                                         message=SimpleNamespace(content='{"row": 7, "col": 7, "reason": "ok"}'))]
+            )
+
+    class _ProfileStrictClient:
+        def __init__(self, *a, **k):
+            self.chat = SimpleNamespace(completions=_ProfileStrictCompletions(calls))
+
+    with patch.object(llm_service, "OpenAI", lambda *a, **k: _ProfileStrictClient()):
+        # 第一战：nvidia off → 探索后 bare 成功，记入 nvidia 的缓存条目
+        llm_service.call_llm("http://p", "k", "m-prof", "p", 0.2,
+                             reasoning_effort="off", thinking_profile="nvidia")
+        # 第二战：同 base_url/model/档位，但方言是 openai-native（off 发 enable_thinking:false，
+        # 该网关接受它）。若缓存 key 未含 profile，会直接命中 nvidia 的 good(bare) 只发 1 次；
+        # 正确行为是独立探索：combo1(rf+enable_thinking) 被拒、combo2(enable_thinking) 成功 → 2 次
+        before = len(calls)
+        llm_service.call_llm("http://p", "k", "m-prof", "p2", 0.2,
+                             reasoning_effort="off", thinking_profile="openai-native")
+        assert len(calls) - before == 2, "openai-native(off) 应独立探索组合，而不是命中 nvidia 的缓存"
+        # 且成功请求按 openai-native 方言发的是 enable_thinking（而非 nvidia 的 thinking）
+        assert calls[-1].get("enable_thinking") is False
+        assert "thinking" not in calls[-1]

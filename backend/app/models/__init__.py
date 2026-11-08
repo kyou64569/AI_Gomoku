@@ -16,6 +16,18 @@ class ModelConfig(Base):
     # 空字符串表示"密钥不入库，从环境变量 LLM_API_KEY_{id} / LLM_API_KEY 读取"
     api_key = Column(String(255), nullable=False, default="")
     models = Column(Text, default="[]")
+    # 协议类型：openai=OpenAI 兼容 /chat/completions（走 thinking_profile 方言）/
+    # gemini=原生 generateContent / anthropic=原生 messages（这两者思考参数见 native_protocols）。
+    # 缺省 openai：存量配置零行为变化。
+    provider = Column(String(20), nullable=False, default="openai")
+    # 思考参数「厂商方言」（thinking_profiles.THINKING_PROFILE_KEYS）：决定「开/关思考 +
+    # 强度」翻译成请求体里哪个字段、什么形状（顶层 enable_thinking / 嵌套
+    # chat_template_kwargs / 字符串·对象·布尔 thinking / 布尔 thinking_mode）。
+    # 挂模型配置（而非玩家）：同一端点的方言是固定的，与选哪档无关。
+    thinking_profile = Column(String(20), nullable=False, default="openai-native")
+    # 模型「思考能力声明」：graded=真分级 / binary=只支持开/关（各档满血）/
+    # none=不发任何思考参数。防止对只支持开/关的模型假装能分级。
+    thinking_capability = Column(String(20), nullable=False, default="graded")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -27,8 +39,9 @@ class AIPlayer(Base):
     model_config_id = Column(Integer, ForeignKey("model_configs.id", ondelete="CASCADE"), nullable=False)
     model_id = Column(String(100), nullable=False)
     temperature = Column(Integer, default=70)
-    # 思考等级（reasoning 模型）：""=默认 / low / medium / high，映射到 reasoning_effort 参数。
-    # 按玩家配置（而非模型配置）：列表中的模型不一定都支持思考等级。
+    # 思考档位（reasoning 模型）：""=未设置（不发任何思考字段，跟随模型默认）/
+    # off=显式关闭 / low / medium / high。禁用与开启的具体字段形状由模型配置的
+    # thinking_profile 方言决定。按玩家配置（而非模型配置）：列表中的模型不一定都支持思考等级。
     reasoning_effort = Column(String(20), nullable=False, default="")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -74,7 +87,8 @@ class Game(Base):
     pending_draw = Column(Integer, default=0)
     # pending_swap：1=第 3 手已落下，等待白方决定是否三手交换
     pending_swap = Column(Integer, default=0)
-    # ended_reason：normal(连五) / draw(满盘) / resign(认输) / agreement(双方同意和棋)
+    # ended_reason：normal(连五) / full(满盘) / resign(认输) / agreement(双方同意和棋)
+    # （写入处：room_service._apply_engine_end 等；实际取值以写入代码为准）
     ended_reason = Column(String(40), default="")
     # review：AI 复盘点评（JSON 字符串），终局后按需生成并缓存
     review = Column(Text, default="")

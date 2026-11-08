@@ -3,11 +3,23 @@ from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-# 使用基于 __file__ 的绝对路径，避免依赖进程 CWD（不同目录启动不会产生"另一份数据库"）
-BACKEND_DIR = Path(__file__).resolve().parent.parent
-SQLALCHEMY_DATABASE_URL = os.getenv(
-    "DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'gomoku.db'}"
-)
+from .runtime_paths import database_file, is_frozen
+
+if is_frozen():
+    # PyInstaller 桌面版：仓库内运行 → 共享网页版 backend/gomoku.db（两端同一份数据，
+    # 用户的预期行为）；拷出仓库单独分发 → exe 同级 data/gomoku.db（可移植）。
+    # DATABASE_URL 环境变量仍可显式覆盖。
+    DB_FILE = database_file()
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SQLALCHEMY_DATABASE_URL = os.getenv(
+        "DATABASE_URL", f"sqlite:///{DB_FILE}"
+    )
+else:
+    # 使用基于 __file__ 的绝对路径，避免依赖进程 CWD（不同目录启动不会产生"另一份数据库"）
+    BACKEND_DIR = Path(__file__).resolve().parent.parent
+    SQLALCHEMY_DATABASE_URL = os.getenv(
+        "DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'gomoku.db'}"
+    )
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 
 

@@ -1,0 +1,5 @@
+# 桌面版（exe）专用依赖：网页版运行不需要；package-exe.bat 打包前后使用
+# - pywebview：原生窗口（Windows 走系统自带 WebView2；缺失时 desktop_main 自动回退浏览器）
+# - pyinstaller：仅打包机需要
+pywebview>=5.0
+pyinstaller>=6.0

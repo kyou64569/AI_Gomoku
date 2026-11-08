@@ -13,13 +13,20 @@ from .routers import (configs_router, players_router, rooms_router, game_router,
                       history_router, arena_router, stats_router)
 from .models import Base
 from .database import engine
+from .runtime_paths import is_frozen, meipass
+from . import runtime_paths
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 加载 backend/.env（API Key 等敏感配置不入库、不进 git）
-load_dotenv()
+# 加载 .env（API Key 等敏感配置不入库、不进 git）。
+# 源码模式按 CWD 找（start.bat 已 pushd 到 backend/）；PyInstaller 桌面版：
+# exe 同级 .env 优先，仓库内运行时共享 backend/.env（与数据库同一套数据）。
+if is_frozen():
+    load_dotenv(runtime_paths.env_file())
+else:
+    load_dotenv()
 
 Base.metadata.create_all(bind=engine)
 
@@ -50,6 +57,21 @@ def _migrate_schema():
                 conn.execute(text("ALTER TABLE model_configs DROP COLUMN reasoning_effort"))
                 conn.commit()
                 logger.info("[migrate] model_configs.reasoning_effort 列已移除（迁移至 ai_players）")
+            # ModelConfig 增加思考方言/能力列（SQLite ADD COLUMN 带默认值会给存量行填默认值，
+            # 存量配置 → openai-native + graded，与旧行为等价）
+            if "thinking_profile" not in mcols:
+                conn.execute(text("ALTER TABLE model_configs ADD COLUMN thinking_profile VARCHAR(20) DEFAULT 'openai-native'"))
+                conn.commit()
+                logger.info("[migrate] model_configs.thinking_profile 列已添加")
+            if "thinking_capability" not in mcols:
+                conn.execute(text("ALTER TABLE model_configs ADD COLUMN thinking_capability VARCHAR(20) DEFAULT 'graded'"))
+                conn.commit()
+                logger.info("[migrate] model_configs.thinking_capability 列已添加")
+            # ModelConfig 增加协议列（openai/gemini/anthropic）；存量配置 = openai 通道，零行为变化
+            if "provider" not in mcols:
+                conn.execute(text("ALTER TABLE model_configs ADD COLUMN provider VARCHAR(20) DEFAULT 'openai'"))
+                conn.commit()
+                logger.info("[migrate] model_configs.provider 列已添加")
             # games 增加 created_at（历史页对局时间）
             # SECURITY NOTE: Table names are hardcoded here to prevent SQL injection
             gcols = [row[1] for row in conn.execute(text("PRAGMA table_info(games)"))]
@@ -146,6 +168,10 @@ app.include_router(history_router)
 app.include_router(arena_router)
 app.include_router(stats_router)
 
-# 前端静态目录：基于 __file__ 的绝对路径，不依赖启动 CWD
-FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
+# 前端静态目录：源码模式基于 __file__ 的绝对路径，不依赖启动 CWD；
+# PyInstaller 桌面版从解包目录（--add-data 打入的 frontend/）读取
+if is_frozen():
+    FRONTEND_DIR = meipass() / "frontend"
+else:
+    FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

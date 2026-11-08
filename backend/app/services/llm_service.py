@@ -7,6 +7,8 @@ from openai import OpenAI
 from openai import BadRequestError, UnprocessableEntityError, NotFoundError, APITimeoutError, APIConnectionError
 from . import game_logic
 from . import metrics
+from . import native_protocols
+from . import thinking_profiles
 from .game_logic import (DIRECTIONS, N, count_line, place_stone, is_valid_move, is_forbidden_move,
                          get_candidate_positions, find_win_line)
 
@@ -412,6 +414,9 @@ def build_prompt(board, turn, history, player_name):
 # 固定采样温度：0.2（低随机，落子稳定；不再从数据库/前端读取）
 TEMPERATURE = 0.2
 
+# 落子请求的系统提示（OpenAI 兼容与原生协议两条路径共用）
+MOVE_SYSTEM_PROMPT = '你是五子棋AI，严格只返回合法JSON，格式：{"row": 0, "col": 0, "reason": "理由"}'
+
 # 输出 token 预算：1024。实测 reasoning 模型 effort=low 时思考仍可达 858 字（≈500+ token），
 # 512 必截断 → 触发 8192 重试反而更慢（30s+）；1024 让一次调用成功（deepseek ~10s 内）。
 # 极端思考失控（2000+ token）时仍用 8192 重试救活。
@@ -427,12 +432,13 @@ TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=15.0, pool=5.0)
 LLM_CALL_DEADLINE = 45.0
 
 # ============ 参数组合缓存（Fix A：消除重复 LLM 调用） ============
-# 同一 (base_url, model_id, reasoning_effort) 的模型，首战后记住哪个参数组合成功、
-# 把返回过 4xx 的组合标记失效。后续落子只发那 1 个成功组合 → LLM 真实请求数从
-# 1~8× 降到精确 1×，避免商汤等按次计费/限流（RPM、5h 500 次）被隐性放大。
+# 同一 (base_url, model_id, reasoning_effort, thinking_profile) 的模型，首战后记住哪个
+# 参数组合成功、把返回过 4xx 的组合标记失效。后续落子只发那 1 个成功组合 → LLM 真实
+# 请求数从 1~8× 降到精确 1×，避免商汤等按次计费/限流（RPM、5h 500 次）被隐性放大。
 # 根因：之前每次落子因 response_format 兼容性问题会逐级降级试遍 2~4 个组合，每个被拒
 # 组合都算 1 次真实 HTTP 请求 → 观战双 AI 自动连下时轻松突破 RPM 触发 429。
-_combo_cache = {}  # key: (base_url, model_id, reasoning_effort) -> {"good": sig|None, "bad": set(sig), "last_used": timestamp}
+# thinking_profile 参与 key：不同方言产出的思考字段形状不同，成功/失败组合互不可复用。
+_combo_cache = {}  # key: (base_url, model_id, reasoning_effort, thinking_profile) -> {"good": sig|None, "bad": set(sig), "last_used": timestamp}
 _combo_cache_lock = threading.Lock()
 _COMBO_CACHE_MAX_SIZE = 100  # 最多缓存 100 个不同模型的组合
 _COMBO_CACHE_TTL = 3600.0  # 缓存 TTL：1 小时后失效（应对 API 兼容性变化）
@@ -504,12 +510,19 @@ def _get_client(base_url: str, api_key: str) -> OpenAI:
         return client
 
 
-def _combo_signature(combo: dict) -> tuple:
-    """组合的结构化指纹（排除 messages / max_tokens：每次落子内容与预算不同，
-    但参数兼容性的差异轴只有 model / response_format / reasoning_effort / temperature / stream 等）。"""
+# 各协议请求体的「每次调用都变 / 与兼容性无关」字段：签名里排除。
+_VOLATILE_OPENAI = ("messages", "max_tokens")
+# 原生协议：contents/systemInstruction 是消息体，maxOutputTokens 是预算（Gemini）
+_VOLATILE_NATIVE = ("messages", "max_tokens", "contents", "systemInstruction", "maxOutputTokens")
+
+
+def _combo_signature(combo: dict, volatile=_VOLATILE_OPENAI) -> tuple:
+    """组合的结构化指纹（排除 volatile 字段：每次落子内容与预算不同，
+    但参数兼容性的差异轴只有 model / response_format / 思考字段（enable_thinking、
+    chat_template_kwargs、thinking、thinking_mode、thinkingConfig 等）/ temperature 等）。"""
     parts = []
     for k in sorted(combo.keys()):
-        if k in ("messages", "max_tokens"):
+        if k in volatile:
             continue
         v = combo[k]
         try:
@@ -521,28 +534,49 @@ def _combo_signature(combo: dict) -> tuple:
 
 
 def chat_json(base_url, api_key, model_id, system_prompt, user_prompt,
-              reasoning_effort="", max_tokens=2048):
+              reasoning_effort="", max_tokens=2048,
+              thinking_profile=thinking_profiles.THINKING_PROFILE_DEFAULT,
+              thinking_capability="graded", provider="openai"):
     """通用 JSON 对话（供「AI 复盘点评」这类一次性分析使用）。
 
-    复用与落子相同的参数降级链（response_format / reasoning_effort 兼容性），
+    复用与落子相同的思考方言与参数降级链（response_format / 思考参数兼容性）；
+    provider=gemini/anthropic 走原生协议分支（native_protocols）。
     返回 dict；失败返回 {"_error": "原因"}。
     """
+    if provider in ("gemini", "anthropic"):
+        return _chat_json_native(base_url, api_key, model_id, system_prompt, user_prompt,
+                                 reasoning_effort, max_tokens, thinking_capability, provider)
     try:
         client = _get_client(base_url, api_key)
     except Exception as e:
         return {"_error": f"客户端创建失败: {e}"}
+    # 思考参数（厂商方言）+ 预算下限：思考 token 计入 max_tokens，按档位抬高防截断
+    try:
+        thinking_kwargs, thinking_floor = thinking_profiles.build_thinking_params(
+            thinking_profile, reasoning_effort, thinking_capability)
+    except ValueError as e:
+        return {"_error": str(e)}
+    if thinking_floor:
+        max_tokens = max(max_tokens, thinking_floor)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    kwargs = dict(model=model_id, messages=messages, temperature=TEMPERATURE, max_tokens=max_tokens)
-    combos = []
-    if reasoning_effort:
+    base_kwargs = dict(model=model_id, messages=messages, temperature=TEMPERATURE)
+    kwargs = {**base_kwargs, "max_tokens": max_tokens, **thinking_kwargs}
+    if thinking_kwargs:
+        # 思考激活：全带 → 只带思考 → 只带 rf → 都不带（rf 组合不含思考字段）
         combos = [
-            {**kwargs, "response_format": {"type": "json_object"}, "reasoning_effort": reasoning_effort},
-            {**kwargs, "reasoning_effort": reasoning_effort},
+            {**kwargs, "response_format": {"type": "json_object"}},
+            kwargs,
+            {**base_kwargs, "max_tokens": max_tokens, "response_format": {"type": "json_object"}},
+            {**base_kwargs, "max_tokens": max_tokens},
         ]
-    combos += [{**kwargs, "response_format": {"type": "json_object"}}, kwargs]
+    else:
+        combos = [
+            {**kwargs, "response_format": {"type": "json_object"}},
+            kwargs,
+        ]
 
     deadline = time.monotonic() + LLM_CALL_DEADLINE
     last_exc = None
@@ -562,7 +596,11 @@ def chat_json(base_url, api_key, model_id, system_prompt, user_prompt,
             break
     if response is None:
         return {"_error": str(last_exc) if last_exc else "LLM 请求失败"}
-    content = response.choices[0].message.content
+    return _parse_json_object(response.choices[0].message.content)
+
+
+def _parse_json_object(content):
+    """从 LLM 文本提取 JSON 对象（截取 {...} 子串）。失败返回 {"_error": 原因}。"""
     if not content or not content.strip():
         return {"_error": "LLM 返回空内容"}
     start = content.find("{")
@@ -576,11 +614,23 @@ def chat_json(base_url, api_key, model_id, system_prompt, user_prompt,
     return data if isinstance(data, dict) else {"_error": "点评返回不是 JSON 对象"}
 
 
-def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=""):
-    """带可观测性埋点的 LLM 调用入口（内部转发到 _call_llm_raw）。"""
+def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort="",
+             thinking_profile=thinking_profiles.THINKING_PROFILE_DEFAULT,
+             thinking_capability="graded", provider="openai"):
+    """带可观测性埋点的 LLM 调用入口（内部按 provider 分发）。
+
+    reasoning_effort 为玩家思考档位（''=未设置 / off / low / medium / high），
+    thinking_profile / thinking_capability 来自模型配置（厂商方言与能力声明）；
+    provider=openai 走 OpenAI 兼容通道，gemini/anthropic 走原生协议分支。
+    """
     started = time.monotonic()
     try:
-        row, col, err = _call_llm_raw(base_url, api_key, model_id, prompt, temperature, reasoning_effort)
+        if provider in ("gemini", "anthropic"):
+            row, col, err = _call_native_raw(base_url, api_key, model_id, prompt, temperature,
+                                             reasoning_effort, thinking_capability, provider)
+        else:
+            row, col, err = _call_llm_raw(base_url, api_key, model_id, prompt, temperature, reasoning_effort,
+                                          thinking_profile, thinking_capability, provider)
     except Exception as e:  # 兜底：任何异常都要计入指标，不能让埋点把调用链打断
         row, col, err = None, None, str(e)
     latency_ms = int((time.monotonic() - started) * 1000)
@@ -593,20 +643,25 @@ def call_llm(base_url, api_key, model_id, prompt, temperature, reasoning_effort=
     return row, col, err
 
 
-def _call_llm_raw(base_url, api_key, model_id, prompt, temperature, reasoning_effort=""):
+def _call_llm_raw(base_url, api_key, model_id, prompt, temperature, reasoning_effort="",
+                  thinking_profile=thinking_profiles.THINKING_PROFILE_DEFAULT,
+                  thinking_capability="graded", provider="openai"):
     """调用 LLM 返回 (row, col, reason)。任何失败返回 (None, None, err_msg)。
 
+    OpenAI 兼容通道（provider='openai'）；gemini/anthropic 由 call_llm 分发到 _call_native_raw。
     健壮性处理：
     - content 可能为 None（某些兼容端点）→ 兜底
     - 内容可能夹杂说明文字 → 提取 JSON 子串
-    - response_format / reasoning_effort 部分端点不支持 → 参数组合逐级降级重试
-      （全带 → 只带 effort → 只带 rf → 都不带）
-    - reasoning 类模型思考可能超预算：512 截断（finish_reason=length）→ 用 8192 重试一次
+    - response_format / 思考参数（按 thinking_profile 方言生成）部分端点不支持 →
+      参数组合逐级降级重试（全带 → 只带思考 → 只带 rf → 都不带）
+    - 未设置档（reasoning_effort=''）不发任何思考字段，请求体与旧版逐字节一致
+    - reasoning 类模型思考可能超预算：按思考档抬预算；仍截断（finish_reason=length）
+      → 用 8192+ 重试一次
     - JSON 解析失败（reasoning 模型偶发输出不完整）→ 自动重试一次
     """
     client = _get_client(base_url, api_key)
     messages = [
-        {"role": "system", "content": "你是五子棋AI，严格只返回合法JSON，格式：{\"row\": 0, \"col\": 0, \"reason\": \"理由\"}"},
+        {"role": "system", "content": MOVE_SYSTEM_PROMPT},
         {"role": "user", "content": prompt}
     ]
     base_kwargs = dict(
@@ -614,20 +669,30 @@ def _call_llm_raw(base_url, api_key, model_id, prompt, temperature, reasoning_ef
         messages=messages,
         temperature=temperature,
     )
+    # 思考参数（厂商方言）：据玩家档位 + 模型能力 + 方言产出请求体字段。未知方言
+    # 在这里抛 ValueError（上游 call_llm 兜底捕获）——报错优于静默回退（§7.5）。
+    thinking_kwargs, thinking_floor = thinking_profiles.build_thinking_params(
+        thinking_profile, reasoning_effort, thinking_capability)
     last_err = ""
     deadline = time.monotonic() + LLM_CALL_DEADLINE
-    cache_key = (base_url, model_id, reasoning_effort)
+    # capability 进 key：graded↔binary 切换后同档位的请求体形状不同（effort 值/预算不同），
+    # 不进 key 会多浪费一轮探测才自愈
+    cache_key = (base_url, model_id, reasoning_effort, thinking_profile, thinking_capability, provider)
     for attempt in range(2):  # 最多重试 1 次（截断升级预算 / 偶发格式不稳）
         max_tokens = MAX_TOKENS_RETRY if attempt == 1 else MAX_TOKENS_NORMAL
-        kwargs = {**base_kwargs, "max_tokens": max_tokens}
-        # 参数组合降级链：逐步去掉 response_format / reasoning_effort（端点兼容性）
-        combos = []
-        if reasoning_effort:
+        if thinking_floor:
+            # 思考开启时按档位抬预算（思考 token 计入 max_tokens，防走法 JSON 被挤掉）；
+            # off / 未设置 floor=None 不动预算。截断升级档要真正高于首战（floor×2），
+            # 否则高档思考下 max(8192, floor) 会逐字节重发同一请求白烧一次调用。
+            max_tokens = max(max_tokens, thinking_floor if attempt == 0 else thinking_floor * 2)
+        kwargs = {**base_kwargs, "max_tokens": max_tokens, **thinking_kwargs}
+        # 参数组合降级链：逐步去掉 response_format / 思考参数（端点兼容性）
+        if thinking_kwargs:
             combos = [
-                {**kwargs, "response_format": {"type": "json_object"}, "reasoning_effort": reasoning_effort},
-                {**kwargs, "reasoning_effort": reasoning_effort},
                 {**kwargs, "response_format": {"type": "json_object"}},
                 kwargs,
+                {**base_kwargs, "max_tokens": max_tokens, "response_format": {"type": "json_object"}},
+                {**base_kwargs, "max_tokens": max_tokens},
             ]
         else:
             combos = [
@@ -707,29 +772,39 @@ def _call_llm_raw(base_url, api_key, model_id, prompt, temperature, reasoning_ef
                 last_err = err
                 continue
             return None, None, err
-        # 提取 JSON 子串（LLM 可能夹带说明文字）
-        start = content.find("{")
-        end = content.rfind("}")
-        if start >= 0 and end > start:
-            content = content[start:end + 1]
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError as e:
-            return None, None, f"LLM 返回 JSON 解析失败: {e}"
-        if not isinstance(data, dict):
-            return None, None, "LLM 返回格式错误：不是 JSON 对象"
-        row_raw = data.get("row")
-        col_raw = data.get("col")
-        if row_raw is None or col_raw is None:
-            # 防御：LLM 返回合法 JSON 但缺 row/col（如 {"move": "7,7"}）→ 明确错误信息
-            return None, None, "LLM 返回格式错误：缺少 row/col 字段"
-        try:
-            row, col = int(row_raw), int(col_raw)
-        except (TypeError, ValueError):
-            return None, None, f"LLM 返回格式错误：row/col 非整数 ({row_raw!r}, {col_raw!r})"
-        reason = data.get("reason", "")
+        row, col, reason, err = _extract_move(content)
+        if err:
+            return None, None, err
         return row, col, reason
     return None, None, last_err
+
+
+def _extract_move(content):
+    """共享：从 LLM 文本提取落子 JSON（截取 {...} 子串 + row/col 校验）。
+
+    返回 (row, col, reason, err)；err 非 None 表示失败（reason 为 ""）。
+    OpenAI 兼容与原生协议两条路径共用。
+    """
+    start = content.find("{")
+    end = content.rfind("}")
+    if start >= 0 and end > start:
+        content = content[start:end + 1]
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        return None, None, "", f"LLM 返回 JSON 解析失败: {e}"
+    if not isinstance(data, dict):
+        return None, None, "", "LLM 返回格式错误：不是 JSON 对象"
+    row_raw = data.get("row")
+    col_raw = data.get("col")
+    if row_raw is None or col_raw is None:
+        # 防御：LLM 返回合法 JSON 但缺 row/col（如 {"move": "7,7"}）→ 明确错误信息
+        return None, None, "", "LLM 返回格式错误：缺少 row/col 字段"
+    try:
+        row, col = int(row_raw), int(col_raw)
+    except (TypeError, ValueError):
+        return None, None, "", f"LLM 返回格式错误：row/col 非整数 ({row_raw!r}, {col_raw!r})"
+    return row, col, data.get("reason", ""), None
 
 
 def _empty_content_err(response, why):
@@ -748,6 +823,185 @@ def _empty_content_err(response, why):
     except Exception:
         pass
     return note
+
+
+# ============ Gemini / Anthropic 原生协议（非流式单轮，native_protocols 构建请求） ============
+
+_HTTP_CLIENT = None
+_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _get_http_client() -> httpx.Client:
+    """原生协议共享的 httpx 客户端（内部连接池按 host 复用，进程内懒加载单例）。"""
+    global _HTTP_CLIENT
+    with _HTTP_CLIENT_LOCK:
+        if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+            _HTTP_CLIENT = httpx.Client(timeout=TIMEOUT)
+        return _HTTP_CLIENT
+
+
+def _native_build_and_parse(provider):
+    if provider == "gemini":
+        return native_protocols.build_gemini_request, native_protocols.parse_gemini_response
+    return native_protocols.build_anthropic_request, native_protocols.parse_anthropic_response
+
+
+def _call_native_raw(base_url, api_key, model_id, prompt, temperature, reasoning_effort="",
+                     thinking_capability="graded", provider="gemini"):
+    """原生协议落子调用，返回 (row, col, reason)。任何失败返回 (None, None, err_msg)。
+
+    降级链（比 OpenAI 路径短，原生协议无 response_format 轴）：
+    - 思考激活时 [带思考, 不带思考] 两个组合；未设置/none 单组合（请求体稳定）
+    - 4xx / 200 但非 JSON → 记降级（record_degraded）换下一组合；5xx / 网络与超时 →
+      与参数无关，直接放弃
+    - 截断（finishReason=MAX_TOKENS / stop_reason=max_tokens）→ attempt 1 抬预算重试一次
+    - thinking_profile 在原生分支不参与（方言注册表仅 OpenAI 兼容协议使用）
+    """
+    if provider not in ("gemini", "anthropic"):
+        return None, None, f"未知的原生协议 provider: {provider}"
+    build, parse = _native_build_and_parse(provider)
+    deadline = time.monotonic() + LLM_CALL_DEADLINE
+    # capability 进 key：graded↔binary 切换后请求体形状不同（见 OpenAI 路径同款注释）
+    cache_key = (base_url, model_id, reasoning_effort, thinking_capability, provider)
+    last_err = ""
+    for attempt in range(2):
+        # 截断升级预算：attempt 1 要真正高于首战（高档 floor 本身已很大，取 floor×2），
+        # 否则 build 内 max(max_tokens, floor) 会得到逐字节相同的请求体 → 白烧一次高价调用
+        escalate = None
+        if attempt == 1:
+            _, _, _, floor_probe, _ = build(base_url, api_key, model_id, MOVE_SYSTEM_PROMPT, prompt,
+                                            reasoning_effort, thinking_capability,
+                                            max_tokens=None, include_thinking=True)
+            escalate = max(MAX_TOKENS_RETRY, (floor_probe or 0) * 2)
+
+        def _build(include_thinking):
+            return build(base_url, api_key, model_id, MOVE_SYSTEM_PROMPT, prompt,
+                         reasoning_effort, thinking_capability,
+                         max_tokens=escalate, include_thinking=include_thinking)
+
+        url, headers, body, _floor, thinking_active = _build(True)
+        combos = [body]
+        if thinking_active:
+            combos.append(_build(False)[2])
+
+        # 组合缓存：与 OpenAI 路径共用一份（key 含 provider，互不串用）
+        with _combo_cache_lock:
+            now = time.monotonic()
+            expired_keys = [k for k, v in _combo_cache.items() if now - v.get("last_used", 0) > _COMBO_CACHE_TTL]
+            for k in expired_keys:
+                del _combo_cache[k]
+            cached = _combo_cache.get(cache_key)
+            if cached is None:
+                cached = {"good": None, "bad": set(), "last_used": now}
+                _combo_cache[cache_key] = cached
+                if len(_combo_cache) > _COMBO_CACHE_MAX_SIZE:
+                    oldest_key = min(_combo_cache.keys(), key=lambda k: _combo_cache[k].get("last_used", 0))
+                    if oldest_key != cache_key:
+                        del _combo_cache[oldest_key]
+            else:
+                cached["last_used"] = now
+            good_sig = cached["good"]
+            bad_sigs = set(cached["bad"])
+
+        def _rank(cand):
+            sig = _combo_signature(cand, _VOLATILE_NATIVE)
+            if good_sig is not None and sig == good_sig:
+                return 0
+            return 2 if sig in bad_sigs else 1
+
+        combos.sort(key=_rank)
+        escalated = False
+        for cand_body in combos:
+            sig = _combo_signature(cand_body, _VOLATILE_NATIVE)
+            if time.monotonic() >= deadline:
+                return None, None, f"LLM 调用超总时长上限 {int(LLM_CALL_DEADLINE)}s"
+            try:
+                resp = _get_http_client().post(url, headers=headers, json=cand_body)
+            except Exception as e:
+                # 网络/超时：与参数组合无关，换组合无意义，直接放弃
+                return None, None, f"{type(e).__name__}: {e}"
+            if resp.status_code >= 500:
+                return None, None, f"上游返回 {resp.status_code}: {resp.text[:300]}"
+            if resp.status_code >= 400:
+                last_err = f"上游返回 {resp.status_code}: {resp.text[:300]}"
+                with _combo_cache_lock:
+                    _combo_cache[cache_key]["bad"].add(sig)
+                metrics.record_degraded(base_url, model_id)
+                continue
+            try:
+                data = resp.json()
+                if not isinstance(data, dict):
+                    raise ValueError("响应不是 JSON 对象")
+                text, truncated = parse(data)
+            except Exception:
+                # 200 但响应体非 JSON / 形状异常（网关错误页、代理劫持、非对象 JSON）：
+                # 按参数不兼容降级到下一组合
+                last_err = f"响应非 JSON: {resp.text[:200]}"
+                with _combo_cache_lock:
+                    _combo_cache[cache_key]["bad"].add(sig)
+                metrics.record_degraded(base_url, model_id)
+                continue
+            if not text.strip():
+                last_err = "LLM 返回空内容" + ("（输出被 max_tokens 截断）" if truncated else "")
+                if attempt == 0 and truncated:
+                    escalated = True
+                    break
+                return None, None, last_err
+            row, col, reason, err = _extract_move(text)
+            if err:
+                return None, None, err
+            with _combo_cache_lock:
+                _combo_cache[cache_key]["good"] = sig
+            return row, col, reason
+        if not (escalated and attempt == 0 and time.monotonic() < deadline):
+            break
+    return None, None, last_err
+
+
+def _chat_json_native(base_url, api_key, model_id, system_prompt, user_prompt,
+                      reasoning_effort, max_tokens, thinking_capability, provider):
+    """原生协议的一次性 JSON 对话（复盘点评；无组合缓存，一次性分析调用）。"""
+    build, parse = _native_build_and_parse(provider)
+
+    def _build(include_thinking):
+        return build(base_url, api_key, model_id, system_prompt, user_prompt,
+                     reasoning_effort, thinking_capability,
+                     max_tokens=max_tokens, include_thinking=include_thinking)
+
+    combos = [_build(True)]
+    if combos[0][4]:  # thinking_active
+        combos.append(_build(False))
+
+    deadline = time.monotonic() + LLM_CALL_DEADLINE
+    last_err = ""
+    for _url, headers, body, _floor, _active in combos:
+        if time.monotonic() >= deadline:
+            return {"_error": f"LLM 调用超总时长上限 {int(LLM_CALL_DEADLINE)}s"}
+        try:
+            resp = _get_http_client().post(_url, headers=headers, json=body)
+        except Exception as e:
+            return {"_error": f"{type(e).__name__}: {e}"}
+        if resp.status_code >= 400:
+            last_err = f"上游返回 {resp.status_code}: {resp.text[:300]}"
+            if resp.status_code < 500:
+                metrics.record_degraded(base_url, model_id)
+                continue
+            return {"_error": last_err}
+        try:
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise ValueError("响应不是 JSON 对象")
+            text, truncated = parse(data)
+        except Exception:
+            # 200 但非 JSON / 形状异常（网关错误页等）：降级到无思考组合重试，
+            # 不让异常逃逸——本函数契约是失败返回 {"_error": ...}
+            last_err = f"响应非 JSON: {resp.text[:200]}"
+            metrics.record_degraded(base_url, model_id)
+            continue
+        if not text.strip():
+            return {"_error": "LLM 返回空内容" + ("（输出被 max_tokens 截断）" if truncated else "")}
+        return _parse_json_object(text)
+    return {"_error": last_err or "LLM 请求失败"}
 
 
 # 难度档位
@@ -828,7 +1082,10 @@ def ai_move(board, turn, history, model_config, player_name, forbidden=False,
             llm_row, llm_col, llm_reason = call_llm(
                 model_config["base_url"], model_config["api_key"],
                 model_config["model_id"], prompt, TEMPERATURE,
-                reasoning_effort=model_config.get("reasoning_effort", "")
+                reasoning_effort=model_config.get("reasoning_effort", ""),
+                thinking_profile=model_config.get("thinking_profile") or thinking_profiles.THINKING_PROFILE_DEFAULT,
+                thinking_capability=model_config.get("thinking_capability") or thinking_profiles.THINKING_CAPABILITY_DEFAULT,
+                provider=native_protocols.normalize_provider(model_config.get("provider")),
             )
         except Exception as e:
             llm_note = f"（LLM 异常: {type(e).__name__}: {e}）"

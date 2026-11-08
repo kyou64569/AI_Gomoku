@@ -211,7 +211,7 @@ def update_game_board(db: Session, game_id: int, board: list, turn: int, history
         game.turn = turn
         game.history = json.dumps(history)
         game.winner = winner
-        game.logs = json.dumps(logs[-500:])  # 500 条 ≈ 整局（225 手×2）完整日志
+        game.logs = json.dumps(logs[-800:])  # 800 条：每手 3 条（落子/决策/权衡），满盘 225 手 = 675 条，取 800 留余量
         game.status = status
         db.commit()
         db.refresh(game)
@@ -286,12 +286,12 @@ def _handle_move_locked(db: Session, game_id: int, player: int, row: int, col: i
     game.turn = turn
     game.history = json.dumps(history)
     game.winner = winner
-    game.logs = json.dumps(logs[-500:])  # 500 条 ≈ 整局（225 手×2）完整日志
+    game.logs = json.dumps(logs[-800:])  # 800 条：每手 3 条（落子/决策/权衡），满盘 225 手 = 675 条，取 800 留余量
     # 三手交换：黑走完第 3 手（黑-白-黑）后，轮到白方决定要不要换边
     if game.status == "playing" and getattr(game, "swap", 0) and len(history) == 3:
         game.pending_swap = 1
         logs.append("三手交换：白方可以选择与黑方交换棋子")
-        game.logs = json.dumps(logs[-500:])
+        game.logs = json.dumps(logs[-800:])
     db.commit()
     db.refresh(game)
     return game
@@ -337,7 +337,7 @@ def resolve_swap(db: Session, game_id: int, accept: bool):
         else:
             logs.append("三手交换：白方选择不交换")
         game.pending_swap = 0
-        game.logs = json.dumps(logs[-500:])
+        game.logs = json.dumps(logs[-800:])
         db.commit()
         db.refresh(game)
         return game
@@ -371,7 +371,7 @@ def undo_moves(db: Session, game_id: int, count: int = 1):
 
         game.board = json.dumps(board)
         game.history = json.dumps(history)
-        game.logs = json.dumps(logs[-500:])
+        game.logs = json.dumps(logs[-800:])
         game.winner = 0
         game.status = "playing"
         game.ended_reason = ""
@@ -397,7 +397,7 @@ def resign_game(db: Session, game_id: int, player: int):
             return None
         logs = _load_logs(game)
         logs.append(f"{'黑方' if player == 1 else '白方'}认输")
-        game.logs = json.dumps(logs[-500:])
+        game.logs = json.dumps(logs[-800:])
         game.winner = 3 - player
         game.status = "finished"
         game.ended_reason = "resign"
@@ -422,7 +422,7 @@ def offer_draw(db: Session, game_id: int, player: int):
         game.pending_draw = player
         logs = _load_logs(game)
         logs.append(f"{'黑方' if player == 1 else '白方'}提出求和")
-        game.logs = json.dumps(logs[-500:])
+        game.logs = json.dumps(logs[-800:])
         db.commit()
         db.refresh(game)
         return game, False
@@ -446,7 +446,7 @@ def respond_draw(db: Session, game_id: int, player: int, accept: bool):
         else:
             logs.append(f"{'黑方' if player == 1 else '白方'}拒绝求和，对局继续")
         game.pending_draw = 0
-        game.logs = json.dumps(logs[-500:])
+        game.logs = json.dumps(logs[-800:])
         db.commit()
         db.refresh(game)
         return game
@@ -550,7 +550,7 @@ def ai_turn(db: Session, game_id: int, model_config: dict, player_name: str,
                 logs = _load_logs(game)
                 logs.append(f"[{player_name}] {reason}")
                 logs.extend(extras)
-                game.logs = json.dumps(logs[-500:])  # 500 条 ≈ 整局（225 手×2）完整日志
+                game.logs = json.dumps(logs[-800:])  # 800 条：每手 3 条（落子/决策/权衡），满盘 225 手 = 675 条，取 800 留余量
                 db.commit()
         except Exception as e:
             # 日志追加失败不影响主流程，但必须记录，避免静默丢失决策原因

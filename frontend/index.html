@@ -833,7 +833,87 @@
     // 思考等级显示文案
     function effortLabel(v) {
       if (!v) return '默认';
-      return ({ low: '低', medium: '中', high: '高' })[v] || v;
+      return ({ off: '关闭', low: '低', medium: '中', high: '高' })[v] || v;
+    }
+
+    // 协议类型选项：openai=OpenAI 兼容（走思考方言），gemini/anthropic=原生协议分支（native_protocols.py）
+    const PROVIDER_OPTIONS = [
+      { value: 'openai', label: 'OpenAI 兼容', baseUrl: 'https://api.openai.com/v1', hint: '兼容 OpenAI /chat/completions 的端点（Qwen/DeepSeek/各类网关），支持思考方言与强度档' },
+      { value: 'gemini', label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com', hint: 'Gemini 官方 API（3 系）。Base URL 填裸域名（末尾带 /v1beta 也会自动纠正），思考走 thinkingLevel' },
+      { value: 'anthropic', label: 'Anthropic', baseUrl: 'https://api.anthropic.com', hint: 'Claude 官方 Messages API。Base URL 填裸域名（末尾带 /v1 也会自动纠正），思考走 budget_tokens' },
+    ];
+
+    // 思考参数「厂商方言」选项：决定「开/关思考 + 强度」发成请求体哪个字段/形状。
+    // 与 backend thinking_profiles.py 的 THINKING_PROFILE_KEYS 一一对应。
+    const THINKING_PROFILE_OPTIONS = [
+      { value: 'openai-native', label: '标准（enable_thinking）', hint: 'Qwen3 / vLLM / 多数 OpenAI 兼容端点：关闭发顶层 enable_thinking:false' },
+      { value: 'chat-template', label: '嵌套式（Dots/Agnes）', hint: '小红书 Dots / Agnes：必须放 chat_template_kwargs.enable_thinking，顶层传法无效（否则配了关闭仍思考）' },
+      { value: 'thinking-flag', label: 'thinking 字符串式', hint: 'MiniMax-M3 系：thinking:"enabled"/"disabled" + reasoning_effort 定档' },
+      { value: 'thinking-type', label: 'thinking 对象式', hint: '腾讯混元 hy3/hy4：thinking:{"type":"enabled"/"disabled"}，与字符串式同名字段不同形状、互不通用' },
+      { value: 'effort-only', label: '仅 reasoning_effort', hint: '无独立开关：关闭发 reasoning_effort:"none"（该写法未经广泛验证，接前先探测）' },
+      { value: 'thinking-mode', label: 'thinking_mode 布尔式', hint: 'Intern-S1（chat.intern-ai.org.cn）：布尔 thinking_mode:true/false，无强度档，能力声明建议选「仅开/关」' },
+      { value: 'nvidia', label: 'NVIDIA NIM 布尔式', hint: 'NVIDIA NIM / Nemotron：布尔 thinking:true/false（字符串会 400），无强度档，能力声明建议选「仅开/关」' },
+    ];
+    const THINKING_CAPABILITY_OPTIONS = [
+      { value: 'graded', label: '分级', hint: 'low/medium/high 各自生效（真 reasoning 模型）' },
+      { value: 'binary', label: '仅开/关', hint: '不分档：低/中/高一律满血思考，求快请选「关闭」档' },
+      { value: 'none', label: '无思考', hint: '不发送任何思考参数（纯 instruct 模型）' },
+    ];
+    function profileLabel(v) {
+      return (THINKING_PROFILE_OPTIONS.find(o => o.value === v) || {}).label || v || '标准';
+    }
+    function capabilityLabel(v) {
+      return (THINKING_CAPABILITY_OPTIONS.find(o => o.value === v) || {}).label || v || '分级';
+    }
+
+    // 配置卡片上的协议/思考方言/能力下拉（改动即 PUT 保存；配置被玩家引用时无法删除重建，这里就地修正）
+    function cfgThinkingSelects(c) {
+      const provOpts = PROVIDER_OPTIONS.map(o =>
+        `<option value="${o.value}" ${(c.provider || 'openai') === o.value ? 'selected' : ''} title="${escapeHtml(o.hint)}">${o.label}</option>`).join('');
+      const isOpenai = (c.provider || 'openai') === 'openai';
+      const profOpts = THINKING_PROFILE_OPTIONS.map(o =>
+        `<option value="${o.value}" ${c.thinking_profile === o.value ? 'selected' : ''} title="${escapeHtml(o.hint)}">${o.label}</option>`).join('');
+      const capOpts = THINKING_CAPABILITY_OPTIONS.map(o =>
+        `<option value="${o.value}" ${c.thinking_capability === o.value ? 'selected' : ''} title="${escapeHtml(o.hint)}">${o.label}</option>`).join('');
+      return `
+        <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--text-2)">协议</span>
+          <select class="select" style="max-width:150px" title="调用通道与思考参数协议（切换后已拉取的模型列表会清空）"
+                  onchange="updateConfigProvider(${c.id}, this.value)">${provOpts}</select>
+          ${isOpenai ? `
+          <span style="font-size:12px;color:var(--text-2)">思考方言</span>
+          <select class="select" style="max-width:210px" title="思考参数发成请求体哪个字段/形状"
+                  onchange="updateConfigThinking(${c.id}, this.value, null)">${profOpts}</select>` : ''}
+          <span style="font-size:12px;color:var(--text-2)">思考能力</span>
+          <select class="select" style="max-width:110px" title="模型思考能力声明：分级 / 仅开关 / 无"
+                  onchange="updateConfigThinking(${c.id}, null, this.value)">${capOpts}</select>
+        </div>`;
+    }
+
+    async function updateConfigProvider(id, provider) {
+      try {
+        const res = await api(`/configs/${id}`, { method: 'PUT', body: JSON.stringify({ provider }) });
+        toast(res.models_cleared ? '协议已切换，已拉取的模型列表已清空（请重新拉取）' : '协议已保存', 'success');
+      } catch (e) {
+        toast('保存失败: ' + (e.message || '网络错误'), 'error');
+      }
+      await loadConfigs();  // 成功后刷新显示；失败时回滚下拉选中值
+    }
+
+    async function updateConfigThinking(id, profile, capability) {
+      const c = state.configs.find(x => x.id === id);
+      if (!c) return;
+      const body = {
+        thinking_profile: profile || c.thinking_profile || 'openai-native',
+        thinking_capability: capability || c.thinking_capability || 'graded',
+      };
+      try {
+        await api(`/configs/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+        toast('思考设置已保存', 'success');
+      } catch (e) {
+        toast('保存失败: ' + (e.message || '网络错误'), 'error');
+      }
+      await loadConfigs();  // 成功后刷新显示；失败时回滚下拉选中值
     }
 
     async function createConfig() {
@@ -1615,6 +1695,7 @@
                 <button class="btn btn-primary" onclick="restartGame()">再来一局</button>
                 <button class="btn btn-ghost" onclick="openReplay()">复盘分析</button>
                 <button class="btn btn-ghost" onclick="viewFinishedGame()">查看棋局</button>
+                <button class="btn btn-ghost" onclick="exportGame(${g.id},'txt')">导出</button>
                 <button class="btn btn-ghost" onclick="goHome()">返回首页</button>
               </div>
             </div>
@@ -1683,6 +1764,7 @@
               ${canAct ? `<button class="btn btn-ghost" onclick="confirmResign(${myPlayerNum})">认输</button>` : ''}
               ${canAct && !g.pending_draw ? `<button class="btn btn-ghost" onclick="offerDraw(${myPlayerNum})">求和</button>` : ''}
               <button class="btn btn-ghost" onclick="openReplay()">复盘</button>
+              <button class="btn btn-ghost" onclick="exportGame(${g.id},'txt')">导出</button>
               <button class="btn btn-ghost" onclick="goHome()">返回首页</button>
             </div>
           </section>
@@ -1816,6 +1898,52 @@
     function gotoReplay(gameId) {
       if (!gameId) return toast('该房间暂无对局可复盘', 'error');
       location.href = `#replay/${gameId}`;
+    }
+
+    // Uint8Array → base64（分块避免大文件时 Function.apply 栈溢出）
+    function _bufToB64(buf) {
+      const bytes = new Uint8Array(buf);
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }
+      return btoa(bin);
+    }
+
+    // 单局导出：思考日志 + 落子记录 + 复盘（后端 Content-Disposition 触发下载）。
+    // 用 fetch+blob 而非直接开链接，以带上 authHeaders（设置 AUTH_TOKEN 时链接会被 401）。
+    // 桌面端（pywebview）走原生「另存为」对话框，保存后提示完整路径；
+    // 浏览器端沙箱拿不到完整路径，提示默认下载目录。
+    async function exportGame(id, format = 'txt') {
+      try {
+        const res = await fetch(`${API}/games/${id}/export?format=${format}`, { headers: authHeaders() });
+        if (!res.ok) {
+          let msg = `HTTP ${res.status}`;
+          try { msg = (await res.json()).detail || msg; } catch (_) {}
+          throw new Error(msg);
+        }
+        const cd = res.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename\*=UTF-8''([^;]+)/i);
+        const name = m ? decodeURIComponent(m[1]) : `gomoku-game-${id}.${format}`;
+        const bridge = window.pywebview && window.pywebview.api;
+        if (bridge && typeof bridge.save_file === 'function') {
+          const buf = await res.arrayBuffer();
+          const savedPath = await bridge.save_file(name, _bufToB64(buf));
+          toast(savedPath ? `已导出：${savedPath}` : '已取消导出', savedPath ? 'success' : 'info');
+          return;
+        }
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 0);  // 立即 revoke 在个别浏览器有竞态
+        toast(`已导出「${name}」→ 浏览器默认下载目录（通常是「下载」文件夹）`, 'success');
+      } catch (e) {
+        toast('导出失败: ' + (e.message || '网络错误'), 'error');
+      }
     }
 
     /* ==================== 对局复盘 ==================== */
@@ -2328,7 +2456,7 @@
             </div>
             <div class="opt-hint">
               指标为进程内累计（重启即清零）。「未采纳」＝ LLM 给了坐标但不合法 / 评分不足而回退引擎；
-              「参数降级」＝ 端点不支持 response_format 或 reasoning_effort 而自动降级的次数。
+              「参数降级」＝ 端点不支持 response_format 或思考参数（按方言生成）而自动降级的次数。
             </div>
             <div class="create-actions">
               <button class="btn btn-ghost btn-sm" onclick="loadStats().then(render)">刷新</button>
@@ -2396,6 +2524,7 @@
               <td style="display:flex;gap:6px">
                 <a class="btn btn-ghost btn-sm" href="#game/${g.id}?view=1">查看</a>
                 <a class="btn btn-ghost btn-sm" href="#replay/${g.id}">复盘</a>
+                <button class="btn btn-ghost btn-sm" onclick="exportGame(${g.id},'txt')">导出</button>
               </td>
             </tr>`;
           }).join('');
@@ -2429,7 +2558,16 @@
             <div class="form-grid">
               <div class="field"><label>配置名称</label><input class="input" id="cfg-name" placeholder="例如：DeepSeek" /></div>
               <div class="field"><label>Base URL</label><input class="input" id="cfg-url" placeholder="https://api.example.com/v1" /></div>
-              <div class="field full"><label>API Key</label><input class="input" id="cfg-key" type="password" placeholder="sk-..." /></div>
+              <div class="field full"><label>API Key</label><input class="input" id="cfg-key" type="password" placeholder="sk-...（可留空，走环境变量 LLM_API_KEY_{id}）" /></div>
+              <div class="field"><label>协议类型</label>
+                <select class="select" id="cfg-provider" onchange="onProviderChange()">${PROVIDER_OPTIONS.map(o => `<option value="${o.value}" title="${escapeHtml(o.hint)}">${o.label}</option>`).join('')}</select>
+              </div>
+              <div class="field" id="cfg-profile-field"><label>思考方言</label>
+                <select class="select" id="cfg-profile">${THINKING_PROFILE_OPTIONS.map(o => `<option value="${o.value}" title="${escapeHtml(o.hint)}">${o.label}</option>`).join('')}</select>
+              </div>
+              <div class="field"><label>思考能力</label>
+                <select class="select" id="cfg-capability">${THINKING_CAPABILITY_OPTIONS.map(o => `<option value="${o.value}" title="${escapeHtml(o.hint)}">${o.label}</option>`).join('')}</select>
+              </div>
             </div>
             <div class="create-actions">
               <button class="btn btn-primary" onclick="submitConfig()">添加配置</button>
@@ -2449,6 +2587,7 @@
                       <button class="btn btn-danger btn-sm" onclick="deleteConfig(${c.id})">删除</button>
                     </div>
                   </div>
+                  ${cfgThinkingSelects(c)}
                   ${c.models?.length ? `<div class="cmodels" style="margin-top:10px;padding:9px 11px;background:#0e1526;border-radius:8px">可用模型：<br><span style="color:var(--text-2);font-family:var(--font-mono)">${c.models.map(m => escapeHtml(m)).join(', ')}</span></div>` : ''}
                 </div>
               `).join('') || '<div class="empty">暂无配置，请添加第一个模型配置</div>'}
@@ -2466,6 +2605,7 @@
                 <label>思考等级</label>
                 <select class="select" id="player-effort">
                   <option value="">默认（不设置）</option>
+                  <option value="off">关闭</option>
                   <option value="low">低</option>
                   <option value="medium">中</option>
                   <option value="high">高</option>
@@ -2500,6 +2640,7 @@
                           <label>思考等级</label>
                           <select class="select" id="edit-player-effort-${p.id}">
                             <option value="" ${(p.reasoning_effort || '') === '' ? 'selected' : ''}>默认（不设置）</option>
+                            <option value="off" ${p.reasoning_effort === 'off' ? 'selected' : ''}>关闭</option>
                             <option value="low" ${p.reasoning_effort === 'low' ? 'selected' : ''}>低</option>
                             <option value="medium" ${p.reasoning_effort === 'medium' ? 'selected' : ''}>中</option>
                             <option value="high" ${p.reasoning_effort === 'high' ? 'selected' : ''}>高</option>
@@ -2540,12 +2681,25 @@
     }
 
     /* ================= 配置提交 ================= */
+    // 协议切换：base_url 为空时自动填该协议的提示地址；思考方言仅 OpenAI 兼容协议使用
+    function onProviderChange() {
+      const provider = document.getElementById('cfg-provider')?.value || 'openai';
+      const urlEl = document.getElementById('cfg-url');
+      const opt = PROVIDER_OPTIONS.find(o => o.value === provider);
+      if (urlEl && !urlEl.value.trim() && opt) urlEl.value = opt.baseUrl;
+      const profField = document.getElementById('cfg-profile-field');
+      if (profField) profField.style.display = provider === 'openai' ? '' : 'none';
+    }
+
     async function submitConfig() {
       const name = document.getElementById('cfg-name').value;
       const baseUrl = document.getElementById('cfg-url').value;
       const apiKey = document.getElementById('cfg-key').value;
-      if (!name || !baseUrl || !apiKey) return toast('请填写完整配置信息', 'error');
-      await api('/configs/', { method: 'POST', body: JSON.stringify({ name, base_url: baseUrl, api_key: apiKey, models: [] }) });
+      const provider = document.getElementById('cfg-provider')?.value || 'openai';
+      const thinkingProfile = document.getElementById('cfg-profile')?.value || 'openai-native';
+      const thinkingCapability = document.getElementById('cfg-capability')?.value || 'graded';
+      if (!name || !baseUrl) return toast('请填写配置名称与 Base URL（API Key 可留空走环境变量）', 'error');
+      await api('/configs/', { method: 'POST', body: JSON.stringify({ name, base_url: baseUrl, api_key: apiKey, models: [], provider, thinking_profile: thinkingProfile, thinking_capability: thinkingCapability }) });
       toast('模型配置已添加', 'success');
       await loadConfigs();
     }

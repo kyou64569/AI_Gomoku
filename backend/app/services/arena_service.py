@@ -71,6 +71,10 @@ def _build_model_config(db: Session, player: AIPlayer):
         "model_id": player.model_id,
         "temperature": player.temperature,
         "reasoning_effort": getattr(player, "reasoning_effort", "") or "",
+        # 协议类型 + 思考方言/能力声明挂在模型配置上（见 thinking_profiles / native_protocols）
+        "provider": getattr(cfg, "provider", "") or "openai",
+        "thinking_profile": getattr(cfg, "thinking_profile", "") or "openai-native",
+        "thinking_capability": getattr(cfg, "thinking_capability", "") or "graded",
     }
 
 

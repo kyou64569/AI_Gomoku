@@ -6,9 +6,17 @@ from ..services import get_ai_player, create_ai_player, list_ai_players, delete_
 from ..services.config_helper import resolve_api_key
 from ..services.llm_service import call_llm, build_prompt, TEMPERATURE
 from ..services.game_logic import create_board
+from ..services.thinking_profiles import THINKING_LEVELS
 from ..models import AIPlayer, ModelConfig
 
 router = APIRouter(prefix="/api/players", tags=["players"])
+
+
+def _validate_effort(reasoning_effort: str):
+    """思考档位白名单：''=未设置 / off=显式关闭 / low / medium / high。"""
+    if reasoning_effort not in THINKING_LEVELS:
+        raise HTTPException(status_code=400,
+                            detail="思考等级必须是 未设置(空) / off / low / medium / high 之一")
 
 
 @router.post("/")
@@ -18,6 +26,7 @@ def create_player(name: str = Body(...), model_config_id: int = Body(...), model
     # Convert to float range 0.0-2.0 by dividing by 100
     if not (0 <= temperature <= 200):
         raise HTTPException(status_code=400, detail="temperature 必须在 0-200 范围内（对应 OpenAI 的 0.0-2.0）")
+    _validate_effort(reasoning_effort)
     if not get_model_config(db, model_config_id):
         raise HTTPException(status_code=400, detail="模型配置不存在")
     return create_ai_player(db, name, model_config_id, model_id, temperature, reasoning_effort)
@@ -41,7 +50,10 @@ def test_llm(model_config_id: int = Body(...), model_id: str = Body(...),
     try:
         prompt = build_prompt(create_board(), 1, [], "AI")
         row, col, reason = call_llm(config.base_url, api_key, model_id, prompt,
-                                    TEMPERATURE, reasoning_effort=reasoning_effort)
+                                    TEMPERATURE, reasoning_effort=reasoning_effort,
+                                    provider=getattr(config, "provider", "") or "openai",
+                                    thinking_profile=getattr(config, "thinking_profile", "") or "openai-native",
+                                    thinking_capability=getattr(config, "thinking_capability", "") or "graded")
         if row is not None:
             return {"status": "ok", "detail": f"连通成功，模型建议落子 ({row},{col})"}
         return {"status": "error", "detail": f"调用失败：{reason}"}
@@ -71,6 +83,7 @@ def update_player(player_id: int, name: str = Body(None), model_config_id: int =
             raise HTTPException(status_code=400, detail="temperature 必须在 0-200 范围内（对应 OpenAI 的 0.0-2.0）")
         player.temperature = temperature
     if reasoning_effort is not None:
+        _validate_effort(reasoning_effort)
         player.reasoning_effort = reasoning_effort
     db.commit()
     db.refresh(player)
@@ -92,7 +105,10 @@ def test_player_llm(player_id: int, reasoning_effort: str = Body(""), db: Sessio
     try:
         prompt = build_prompt(create_board(), 1, [], player.name)
         row, col, reason = call_llm(config.base_url, api_key, player.model_id, prompt,
-                                    TEMPERATURE, reasoning_effort=reasoning_effort)
+                                    TEMPERATURE, reasoning_effort=reasoning_effort,
+                                    provider=getattr(config, "provider", "") or "openai",
+                                    thinking_profile=getattr(config, "thinking_profile", "") or "openai-native",
+                                    thinking_capability=getattr(config, "thinking_capability", "") or "graded")
         if row is not None:
             return {"status": "ok", "detail": f"连通成功，模型建议落子 ({row},{col})"}
         return {"status": "error", "detail": f"调用失败：{reason}"}

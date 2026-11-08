@@ -2,8 +2,9 @@ import json
 import asyncio
 import threading
 import time
-from fastapi import APIRouter, Depends, HTTPException, Body, Request
-from fastapi.responses import StreamingResponse
+from urllib.parse import quote
+from fastapi import APIRouter, Depends, HTTPException, Body, Request, Query
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 from ..database import get_db, SessionLocal
 from ..services.room_service import (
@@ -14,6 +15,7 @@ from ..services.room_service import (
 from ..services.config_helper import resolve_api_key
 from ..services.analysis_service import analyze_game, review_game
 from ..models import Game, AIPlayer, ModelConfig, Room
+from .history import _get_player_names
 
 router = APIRouter(prefix="/api/games", tags=["games"])
 
@@ -149,7 +151,11 @@ def trigger_ai_if_needed(game_id, db):
             "api_key": resolve_api_key(config),
             "model_id": player.model_id,
             "temperature": player.temperature,
-            "reasoning_effort": getattr(player, "reasoning_effort", "") or ""
+            "reasoning_effort": getattr(player, "reasoning_effort", "") or "",
+            # 协议类型 + 思考方言/能力声明挂在模型配置上（见 thinking_profiles / native_protocols）
+            "provider": getattr(config, "provider", "") or "openai",
+            "thinking_profile": getattr(config, "thinking_profile", "") or "openai-native",
+            "thinking_capability": getattr(config, "thinking_capability", "") or "graded",
         }
 
         def do_ai_move():
@@ -548,3 +554,140 @@ def stream_game(game_id: int, request: Request):
             pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ============ 单局导出（思考日志 + 落子记录 + 复盘） ============
+
+_EXPORT_MODES = {"pve": "人机", "pvp": "真人对战", "watch": "AI 观战"}
+# ended_reason 实际取值以 room_service/game.py 的写入为准（full=满盘，模型列注释曾误写 draw）
+_EXPORT_REASONS = {"normal": "连五", "full": "满盘和棋", "draw": "满盘和棋",
+                   "resign": "认输", "agreement": "双方同意和棋"}
+_EXPORT_DIFFICULTY = {"easy": "简单", "normal": "普通", "hard": "困难"}
+
+
+def _game_export_payload(game: Game, room: Room | None) -> dict:
+    """把单局数据打包成结构化 dict（txt / json 两种渲染共用同一份来源）。"""
+    try:
+        history = json.loads(game.history) or []
+        if not isinstance(history, list):
+            history = []
+    except (json.JSONDecodeError, TypeError):
+        history = []
+    try:
+        logs = json.loads(game.logs) or []
+        if not isinstance(logs, list):
+            logs = []
+    except (json.JSONDecodeError, TypeError):
+        logs = []
+    try:
+        review = json.loads(game.review) if game.review else None
+    except (json.JSONDecodeError, TypeError):
+        review = None
+    try:
+        opts = json.loads(room.options) if room else {}
+        if not isinstance(opts, dict):
+            opts = {}
+    except (json.JSONDecodeError, TypeError):
+        opts = {}
+
+    black, white = _get_player_names(game, room)
+    if game.status not in ("finished", "draw"):
+        result_text = "未分出胜负"
+    elif game.status == "draw" or game.winner == 0:
+        result_text = "平局"
+    elif game.winner == 1:
+        result_text = f"黑方 {black} 胜"
+    else:
+        result_text = f"白方 {white} 胜"
+    return {
+        "game": {
+            "id": game.id,
+            "mode": room.mode if room else "pve",
+            "options": opts,
+            "black": black,
+            "white": white,
+            "winner": game.winner,
+            "status": game.status,
+            "ended_reason": game.ended_reason or "",
+            "result_text": result_text,
+            "created_at": game.created_at.isoformat() if game.created_at else None,
+            "moves": len(history),
+        },
+        "moves": [{"no": i + 1, "player": mv.get("player"), "name": mv.get("player_name") or "AI",
+                   "row": mv.get("row"), "col": mv.get("col")} for i, mv in enumerate(history)],
+        "logs": [str(x) for x in logs],
+        "review": review if isinstance(review, dict) else None,
+    }
+
+
+def _render_export_txt(payload: dict) -> str:
+    g = payload["game"]
+    opts = g.get("options") or {}
+    opt_text = " · ".join(filter(None, [
+        f"{opts.get('size', 15)} 路",
+        "禁手" if opts.get("forbidden") else "自由",
+        _EXPORT_DIFFICULTY.get(opts.get("difficulty"), ""),
+        "白先" if opts.get("first") == 2 else "黑先",
+    ]))
+    reason = _EXPORT_REASONS.get(g.get("ended_reason"), "")
+    result = f"{g['result_text']}（{reason}）" if reason else g["result_text"]
+    # 时间美化：ISO 原始串（2026-11-08T11:04:09.669666）→ 2026-11-08 11:04:09
+    created = (g.get("created_at") or "—").replace("T", " ").split(".")[0]
+    lines = [
+        f"AI Gomoku 对局导出 · #{g['id']}",
+        "=" * 46,
+        f"时间：{created}",
+        f"模式：{_EXPORT_MODES.get(g.get('mode'), g.get('mode') or '—')}（{opt_text}）",
+        f"黑方：{g['black']}    白方：{g['white']}",
+        f"结果：{result} · 共 {g['moves']} 手",
+        "",
+        "---- 落子记录 ----",
+    ]
+    for mv in payload["moves"]:
+        color = "黑" if mv["player"] == 1 else "白"
+        lines.append(f"{mv['no']:>3}. {color} {mv['name']}  ({mv['row']},{mv['col']})")
+    lines.append("")
+    lines.append("---- AI 思考日志 ----")
+    lines.extend(f"[{i:03d}] {line}" for i, line in enumerate(payload["logs"], 1))
+    review = payload.get("review")
+    if review:
+        lines.append("")
+        lines.append("---- AI 复盘点评 ----")
+        if review.get("summary"):
+            lines.append(f"总结：{review['summary']}")
+        if review.get("turning_point"):
+            lines.append(f"转折点：{review['turning_point']}")
+        moments = review.get("key_moments") or []
+        if moments:
+            lines.append("关键点：")
+            lines.extend(f"  - 第{m.get('move_no')}手 {m.get('player', '')}：{m.get('comment', '')}"
+                         for m in moments)
+    return "\n".join(lines) + "\n"
+
+
+@router.get("/{game_id}/export")
+def export_game(game_id: int, format: str = Query("txt", pattern="^(txt|json)$"),
+                db: Session = Depends(get_db)):
+    """导出单局（思考日志 + 落子记录 + 复盘）。
+
+    format=txt（默认，人读）/ json（程序分析）。响应带 Content-Disposition 触发
+    浏览器下载；进行中的对局也可导出（导出当前已产生的内容）。
+    """
+    game = get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="对局不存在")
+    room = db.query(Room).filter(Room.id == game.room_id).first()
+    payload = _game_export_payload(game, room)
+    if format == "json":
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        media_type = "application/json; charset=utf-8"
+    else:
+        body = _render_export_txt(payload)
+        media_type = "text/plain; charset=utf-8"
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="gomoku-game-{game_id}.{format}"; '
+            f"filename*=UTF-8''{quote(f'对局-{game_id}.{format}')}"
+        )
+    }
+    return Response(content=body, media_type=media_type, headers=headers)

@@ -8,8 +8,10 @@ rem comments can split a line or turn into command separators, producing
 rem errors like "'...' is not recognized as an internal or external command".
 
 rem --- constants ---
-rem Prefer PYTHON_PATH env var; fall back to managed Python 3.13.12; then py -3.10.
-if defined PYTHON_PATH (
+rem Prefer project venv (backend\.venv); then PYTHON_PATH env var; then managed Python 3.13.12; then py -3.10.
+if exist "%~dp0backend\.venv\Scripts\python.exe" (
+    set "PY=%~dp0backend\.venv\Scripts\python.exe"
+) else if defined PYTHON_PATH (
     set "PY=%PYTHON_PATH%"
 ) else (
     set "PY=C:\Users\asus\.workbuddy\binaries\python\versions\3.13.12\python.exe"

@@ -12,9 +12,23 @@ def get_model_config(db: Session, config_id: int):
     return db.query(ModelConfig).filter(ModelConfig.id == config_id).first()
 
 
-def create_model_config(db: Session, name: str, base_url: str, api_key: str):
-    config = ModelConfig(name=name, base_url=base_url, api_key=api_key)
+def create_model_config(db: Session, name: str, base_url: str, api_key: str,
+                        thinking_profile: str = "openai-native", thinking_capability: str = "graded",
+                        provider: str = "openai"):
+    config = ModelConfig(name=name, base_url=base_url, api_key=api_key,
+                         thinking_profile=thinking_profile, thinking_capability=thinking_capability,
+                         provider=provider)
     db.add(config)
+    db.commit()
+    db.refresh(config)
+    return config
+
+
+def update_model_config(db: Session, config: ModelConfig, **fields):
+    """部分更新模型配置（仅应用 fields 里非 None 的项），返回刷新后的 config。"""
+    for key, value in fields.items():
+        if value is not None:
+            setattr(config, key, value)
     db.commit()
     db.refresh(config)
     return config
